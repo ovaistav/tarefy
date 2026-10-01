@@ -1,0 +1,428 @@
+================================================================================
+                        DELIVERY REPORT
+        Django + DRF backend for the Android app "inventory" tab
+================================================================================
+
+Project      : D:\test  (started from an empty directory)
+Specification : todo.txt (86 lines, 7 mandatory steps)
+Date         : 2026-10-01
+Status       : COMPLETE - all 7 steps delivered, 35/35 tests passing,
+                          all endpoints verified against a live server
+
+
+================================================================================
+1. EXECUTIVE SUMMARY
+================================================================================
+
+A production-shaped REST backend was built from scratch to serve the inventory tab
+of a vegetable seller's Android app. The hard part of this spec is not the CRUD -
+it is the concurrency contract. The app labels incoming loads offline and then
+syncs them, so two phones can easily describe mutually inconsistent views of the
+same product. The server therefore never trusts the client's picture: on every
+write it recomputes the truth from the database, and if the client's view is out
+of date it answers 409 with a machine-readable code instead of silently corrupting
+state.
+
+Three design decisions carry most of the weight:
+
+  1. A PARTIAL UNIQUE CONSTRAINT, not application logic. "Among available loads a
+     product cannot have two loads with the same label" is enforced by the
+     database itself (UniqueConstraint with condition Q(finished_at__isnull=True)).
+     Application checks can be raced; this cannot. A concurrent writer loses at
+     COMMIT time and the IntegrityError is translated into the same 409 the
+     application-level check would have produced.
+
+  2. A SINGLE SOURCE OF TRUTH FOR THE CLIENT'S VIEW. On POST, the set of ids in
+     existing_labels must be EXACTLY the set of ids that currently have an empty
+     label. Extra id, missing id, or a duplicate id all mean the same thing: the
+     client's screen is stale, so it gets 409 stale_state and must refetch. No
+     attempt counter, no timestamp grace period - just current state.
+
+  3. IDEMPOTENT ACTIONS. finish and restore are safe to retry. The mobile network
+     drops requests, and a retried "finish" must not be able to change a load that
+     a human already restored. Both endpoints are expressed as conditional
+     UPDATEs (WHERE finished_at IS NULL / IS NOT NULL), so the second call is a
+     no-op that still returns 200 with the current state.
+
+Deliverable: 7 commits (one per spec step), 35 automated tests, a README whose
+curl examples are copied from real server responses rather than written from
+memory.
+
+
+================================================================================
+2. WHAT WAS BUILT
+================================================================================
+
+2.1 Endpoints
+--------------------------------------------------------------------------------
+  GET    /catalog/products/                200  plain list, no pagination
+  GET    /inventory/loads/?available=true  200  plain list, finished loads hidden
+  POST   /inventory/loads/                 201  create a load
+  POST   /inventory/loads/{id}/finish/     200  idempotent
+  POST   /inventory/loads/{id}/restore/    200  idempotent
+
+  All views are class-based DRF (ListAPIView / ListCreateAPIView / APIView).
+  There is not a single @api_view or function-based view in the codebase.
+  There is not a single fields = "__all__" in the codebase (verified by grep).
+
+2.2 Response shapes as shipped
+--------------------------------------------------------------------------------
+  GET /catalog/products/
+  [{"id":1,"name":"خیار","image_url":null,
+    "updated_at":"2026-10-01T13:20:43.684689+03:30"}]
+
+  With an image, image_url is absolute and cache-busted:
+  "http://10.0.2.2:8000/media/products/cucumber.png?v=1767225643"
+
+  GET /inventory/loads/?available=true
+  [{"id":1,"product":1,"product_name":"خیار","label":"الف"},
+   {"id":2,"product":1,"product_name":"خیار","label":"ب"}]
+
+  409 (both variants share one envelope so the app can branch on "code"):
+  {"code":"stale_state",
+   "detail":"وضعیت بارها تغییر کرده است. لطفاً دوباره تلاش کنید."}
+  {"code":"restore_conflict",
+   "detail":"بار دیگری با همین برچسب موجود است."}
+
+2.3 Data model
+--------------------------------------------------------------------------------
+  catalog.Product
+    name, tare_weight, image (products/), image_updated_at, updated_at
+    save() moves image_updated_at ONLY when the image file actually changed.
+
+  inventory.Supplier        name                                   (placeholder)
+  inventory.GoodsReceipt    created_at                             (placeholder)
+  inventory.Load
+    receipt, status, supplier, product, label, weight, rate, quantity,
+    arrived_at, finished_at, created_at, updated_at
+    label is CharField(max_length=50) NEVER null, default ""
+    available  ==  (finished_at IS NULL)   -- there is no separate model
+
+  The two placeholders exist because the receipts and accounting tabs come
+  later. They are registered in admin and deliberately have NO endpoints.
+
+2.4 The constraint that makes the whole thing safe
+--------------------------------------------------------------------------------
+  class Meta:
+      constraints = [
+          models.UniqueConstraint(
+              fields=['product', 'label'],
+              condition=Q(finished_at__isnull=True),
+              name='uniq_available_product_label',
+          )
+      ]
+
+  Consequences, all covered by tests:
+    - two AVAILABLE loads, same product, same label  -> IntegrityError
+    - two AVAILABLE loads, same product, BOTH EMPTY  -> IntegrityError
+      (two empty labels still conflict; this is easy to get wrong)
+    - a FINISHED load with the same label              -> allowed
+      (history is excluded, so a label can be reused after finish)
+    - the same label on a DIFFERENT product            -> allowed
+
+
+================================================================================
+3. WORK PERFORMED, STEP BY STEP
+================================================================================
+
+STEP 1 - Project scaffold                                    commit b3d32da
+--------------------------------------------------------------------------------
+  Asked and confirmed two ambiguities before writing any code (see section 7).
+  Created the virtualenv, pinned dependencies, generated the config project and
+  the two apps, wired the settings, and made the first commit.
+
+  Settings applied exactly as specified:
+    TIME_ZONE  = 'Asia/Tehran'      USE_TZ  = True
+    MEDIA_URL  = '/media/'          MEDIA_ROOT = BASE_DIR/'media'
+    ALLOWED_HOSTS = ['*']           (with a "development only" comment)
+    SECRET_KEY  development key     (with a comment saying to replace it)
+    REST_FRAMEWORK = {'DEFAULT_PERMISSION_CLASSES':
+                      ['rest_framework.permissions.AllowAny']}
+  Root urls: /admin/, /catalog/, /inventory/, plus media in DEBUG.
+  .gitignore: .venv/, __pycache__/, *.pyc, db.sqlite3, media/
+
+STEP 2 - catalog app and Product                              commit b3a0b36
+--------------------------------------------------------------------------------
+  The subtle requirement: image_updated_at is the Android app's IMAGE CACHE KEY,
+  so it must not move when a product is renamed or its tare weight is edited.
+  save() therefore compares the incoming file name against the stored one and
+  only stamps a new time on a real change (or on the first image).
+
+STEP 3 - inventory models                                    commit 36b8f47
+--------------------------------------------------------------------------------
+  Supplier, GoodsReceipt, Load, the partial unique constraint, and
+  normalize_label(): trim, collapse repeated whitespace, and map the Arabic
+  yeh/kaf onto their Persian twins. Normalization lives in the model's save() as
+  well as in the serializer, so admin edits and API writes behave identically.
+
+STEP 4 - GET /catalog/products/                              commit a61137d
+--------------------------------------------------------------------------------
+  ListAPIView, ordered by -updated_at then name, image_url built from the request
+  via build_absolute_uri (correct behind any host/port the emulator uses) and
+  versioned from image_updated_at, with 0 when the product has no image.
+
+STEP 5 - inventory endpoints and the 409 envelope            commit 46c65d1
+--------------------------------------------------------------------------------
+  config/api.py holds a small exception hierarchy - ConflictAPIException with
+  StaleStateConflict and RestoreConflict - plus one exception handler that renders
+  them as {"code", "detail"} and localizes the framework's own errors.
+
+  POST /inventory/loads/ performs, in order:
+    1. serializer validation of product / label / existing_labels
+    2. read current available loads E and the unlabeled subset U
+    3. id-set equality between existing_labels and U, else 409 stale_state
+    4. if E is empty -> label optional
+       if E is not empty -> label required, and all final labels must be
+       non-blank and distinct, else 400 with the error on "label"
+    5. ONE transaction.atomic():
+           a. relabel the submitted existing loads with queryset .update()
+              (label + updated_at together)
+           b. create the new Load (status stays "pending")
+           c. Product.objects.filter(pk=...).update(updated_at=now)
+              so recently used products float to the top of the catalog
+    6. IntegrityError anywhere above -> 409 stale_state (a lost race)
+
+  finish and restore are conditional UPDATEs, so both are naturally idempotent;
+  only a genuinely unknown id yields 404. restore catches IntegrityError inside
+  transaction.atomic() and answers 409 restore_conflict.
+
+STEP 6 - Test suite, 35 tests, all green                    commit 837b240
+--------------------------------------------------------------------------------
+  Full list in section 4. During this step two of my own tests were wrong, not
+  the code, and both were corrected after re-reading the spec:
+    - a test sent existing_labels for an already-LABELED load, which the spec
+      forbids (existing_labels must describe exactly the UNLABELED loads) and
+      which correctly returned 409;
+    - a restore test left the "blocker" load finished, so there was nothing to
+      conflict with.
+  Also caught a genuine weakness: two image changes inside the same second produce
+  the same ?v= value, so those assertions now pin the clock with mock.patch.
+
+STEP 7 - seed_demo, README, curl examples                    commit 2d0c0f8
+--------------------------------------------------------------------------------
+  seed_demo creates 12 products via get_or_create (verified: 12 created, then 0
+  created on a second run). The README's setup steps, emulator instructions
+  (runserver 0.0.0.0:8000, emulator uses 10.0.2.2:8000) and every curl example
+  were produced by running a real server and pasting the real responses back.
+
+
+================================================================================
+4. TEST RESULTS
+================================================================================
+
+  Ran 35 tests in 0.211s
+  OK
+
+  catalog.tests (6)
+    ProductListTests
+      test_products_are_ordered_by_updated_at_then_name
+      test_image_url_is_null_without_image
+      test_image_url_uses_image_updated_at_version
+      test_changing_the_image_changes_the_version
+      test_changing_only_the_name_keeps_the_version
+    ProductImageTimestampTests
+      test_image_updated_at_is_set_on_first_image_only
+
+  inventory.tests (29)
+    LoadCreationTests
+      test_first_load_without_label_is_created_with_empty_label
+      test_second_post_without_existing_labels_is_stale            -> 409
+      test_second_post_with_existing_labels_labels_both_loads       -> 201
+      test_third_post_with_only_a_new_label                         -> 201
+      test_duplicate_label_for_same_product_is_rejected             -> 400
+      test_same_label_on_a_different_product_is_accepted            -> 201
+      test_missing_label_when_loads_exist_is_rejected               -> 400
+      test_existing_labels_with_wrong_id_is_stale                   -> 409
+      test_existing_labels_with_extra_id_is_stale                   -> 409
+      test_duplicate_ids_in_existing_labels_are_stale               -> 409
+      test_arabic_and_persian_labels_are_duplicates
+      test_arabic_and_persian_variants_of_the_same_label_collide    -> 400
+      test_arabic_and_persian_variants_of_kaf_collide              -> 400
+      test_label_is_normalized_before_saving
+    LoadFinishTests
+      test_finish_is_idempotent
+      test_finish_unknown_id_returns_404
+      test_same_label_allowed_after_finish
+    LoadRestoreTests
+      test_restore_conflicts_with_available_same_label             -> 409
+      test_restore_succeeds_after_the_other_load_is_finished
+      test_restoring_an_available_load_is_ok
+      test_restore_unknown_id_returns_404
+    LoadListTests
+      test_list_without_filter_returns_all_loads
+      test_available_true_filters_finished_loads
+      test_list_is_ordered_by_product_name_then_id
+    ProductTouchTests
+      test_creating_a_load_touches_the_product
+      test_recently_used_product_comes_first_in_the_catalog
+    DatabaseConstraintTests  (plain TestCase: proves the DB, not the app)
+      test_two_available_loads_with_the_same_label_are_rejected
+      test_two_available_loads_with_empty_label_are_rejected
+      test_finished_loads_are_excluded_from_the_constraint
+
+  Every test named in section 4 of the spec is present and passing, including the
+  database-level constraint proofs.
+
+  Beyond unit tests, the whole flow was exercised live over HTTP:
+    POST first load            -> 201, label ""
+    POST again, no existing    -> 409 stale_state
+    POST with existing_labels  -> 201, both labels saved
+    POST third, new label only -> 201
+    POST duplicate label       -> 400 {"label":[...]}
+    POST missing label         -> 400 {"label":[...]}
+    finish x2                  -> 200, 200 (unchanged)
+    same label after finish    -> 201
+    restore while blocked      -> 409 restore_conflict
+    finish blocker, restore    -> 200
+    restore again              -> 200
+    unknown id                 -> 404 (Persian detail)
+    GET ?available=true        -> finished loads correctly excluded
+
+
+================================================================================
+5. FILE INVENTORY  (35 files tracked, ~830 lines of Python)
+================================================================================
+
+  config/settings.py                       103   settings, AllowAny, fa locale
+  config/urls.py                            10   /admin/ /catalog/ /inventory/
+  config/api.py                             42   409 hierarchy + handler
+  config/wsgi.py, config/asgi.py            20   (generated)
+
+  catalog/models.py                         26   Product + image cache key
+  catalog/serializers.py                    20   image_url with ?v=
+  catalog/views.py                           7   ListAPIView
+  catalog/urls.py                            5
+  catalog/admin.py                           7   image upload
+  catalog/migrations/0001_initial.py        22
+  catalog/tests.py                         105   6 tests
+
+  inventory/models.py                       76   Load + constraint + normalize
+  inventory/serializers.py                  61   business rules, Persian errors
+  inventory/views.py                        79   4 endpoints, transactions
+  inventory/urls.py                           9
+  inventory/admin.py                        14   list/filter as specified
+  inventory/management/commands/seed_demo.py 29   idempotent, 12 products
+  inventory/migrations/0001_initial.py      52
+  inventory/tests.py                       259   29 tests
+
+  requirements.txt, .gitignore, README.md, manage.py, todo.txt
+
+
+================================================================================
+6. HOW THE ANDROID CLIENT IS EXPECTED TO TALK TO THIS
+================================================================================
+
+  1. GET /catalog/products/ on app start. Recently used products are already
+     first, because creating a load touches the product.
+  2. Cache product images by the full image_url INCLUDING the ?v= suffix. The
+     version tracks image_updated_at, so it changes only when the picture
+     changes - not when the name is edited.
+  3. GET /inventory/loads/?available=true to show the labels you may pick.
+  4. When the user adds a load, send every currently-UNLABELED load you know
+     about in existing_labels, each with the label the user just typed for it,
+     plus the new label. Get this exactly right and you get 201.
+  5. On 409 stale_state: do not retry the same body. Refetch the loads, rebuild
+     the screen, let the user re-enter labels. On 409 restore_conflict: tell the
+     user another load already holds that label.
+  6. On 400: the error is on a named field; show it next to the label input.
+  7. finish and restore may be retried freely.
+
+
+================================================================================
+7. DECISIONS, ASSUMPTIONS AND OPEN ITEMS
+================================================================================
+
+7.1 Asked before starting (the spec instructed stopping rather than guessing)
+--------------------------------------------------------------------------------
+  Q: .gitignore line 17 was garbled - ".vepycachehe__". How should I read it?
+  A: .venv/  __pycache__/  *.pyc  db.sqlite3  media/
+
+  Q: Which Django is "latest stable LTS"?
+  A: Django>=5.2,<6.0   (resolved to 5.2.17)
+
+7.2 Assumptions made and recorded
+--------------------------------------------------------------------------------
+  - Label normalization (trim, collapse spaces, Arabic->Persian) is applied on
+    every save AND on incoming input, so duplicate and blank checks all compare
+    normalized values. Consequently "unlabeled" means normalized label == "".
+  - existing_labels: the IDS are validated against the unlabeled set, but the
+    LABELS supplied are authoritative and are written via queryset .update().
+  - restore on an already-available load returns 200 immediately, without
+    attempting a conflicting write. Idempotency was judged more important than
+    re-checking a constraint the row already satisfies.
+  - 400 responses are ordinary DRF field errors; only 409s use the
+    {"code", "detail"} envelope, exactly as the spec scoped it.
+  - 409 is returned for both the application-level mismatch and a lost race.
+    The client action is the same in both cases - refetch - so the app does not
+    need to distinguish them.
+  - GoodsReceipt is registered in admin as well as Supplier and Load, because
+    Load.receipt would otherwise be impossible to fill in by hand. No endpoints
+    were added for it.
+  - One migration per app was sufficient; no follow-up migrations were needed.
+
+7.3 Beyond the literal spec, and why
+--------------------------------------------------------------------------------
+  Two additions were made solely to satisfy the rule that all user-facing error
+  messages must be in Persian. Both are small and reversible:
+
+    - LANGUAGE_CODE = 'fa'. Django and DRF both ship a 'fa' locale, so this one
+      line makes DRF's own validation messages Persian ("این مقدار لازم است.")
+      instead of English ("This field is required.").
+    - Persian details for 404, 405 and malformed JSON in the exception handler,
+      because DRF ships no translation for those.
+
+7.4 Known limitations worth knowing
+--------------------------------------------------------------------------------
+  - ?v= has one-second resolution, so two image changes inside the same second
+    yield the same cache key. This is inherent to the int-timestamp scheme the
+    spec mandated; the tests pin the clock around it.
+  - The IntegrityError -> 409 path for a genuine race is implemented but not
+    unit tested; simulating a true concurrent commit in SQLite is awkward. The
+    database-level constraint itself IS tested directly.
+  - SECRET_KEY and ALLOWED_HOSTS are development values, commented as such.
+  - No authentication, by design. JWT is the next step and the AllowAny default
+    is the single line to revisit when it arrives.
+
+7.5 Suggested next steps
+--------------------------------------------------------------------------------
+  1. Add JWT and switch DEFAULT_PERMISSION_CLASSES to IsAuthenticated.
+  2. Move off SQLite before any real multi-device usage.
+  3. Add the receipts and accounting endpoints the placeholders were left for.
+  4. Replace the development SECRET_KEY and ALLOWED_HOSTS with real settings.
+  5. Consider a client-generated idempotency key for POST /inventory/loads/ so a
+     retried create cannot produce two loads.
+
+
+================================================================================
+8. HOW TO RUN IT
+================================================================================
+
+  python -m venv .venv
+  .venv\Scripts\activate                     (source .venv/bin/activate on mac/Linux)
+  pip install -r requirements.txt
+  python manage.py migrate
+  python manage.py createsuperuser
+  python manage.py seed_demo                 # 12 products, safe to run twice
+  python manage.py test                      # 35 tests
+  python manage.py runserver 0.0.0.0:8000    # emulator reaches it at 10.0.2.2:8000
+
+  Full endpoint documentation and curl examples: README.md
+
+
+================================================================================
+9. COMMIT HISTORY
+================================================================================
+
+  2d0c0f8  Step 7: seed_demo command, README with verified curl examples
+  837b240  Step 6: full test suite (35 tests) plus Persian error messages
+  46c65d1  Step 5: inventory endpoints (list/create/finish/restore) and 409 shape
+  a61137d  Step 4: GET /catalog/products/ with absolute cache-busted image_url
+  36b8f47  Step 3: inventory models with partial unique constraint + normalization
+  b3a0b36  Step 2: catalog app with Product model (image cache key) and admin
+  b3d32da  Step 1: scaffold config project, catalog and inventory apps
+
+  One commit per spec step, in order, working tree clean.
+
+================================================================================
+END OF REPORT
+================================================================================
