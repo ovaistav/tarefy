@@ -1,0 +1,86 @@
+Build a complete Django + Django REST Framework backend FROM SCRATCH in the current empty directory. Do not assume any existing code. The backend serves the "inventory" tab of a vegetable seller's Android app. Follow the spec exactly and do not add features that are not listed.
+
+## 0. Working rules
+- Start by listing your assumptions in a few lines, then work in small steps. After each step run python manage.py check, makemigrations, migrate and the tests (once they exist). Initialize a git repo and make one clear commit per step.
+- Steps in order: (1) project scaffold, (2) catalog app and Product, (3) inventory app and models, (4) catalog endpoint, (5) inventory endpoints, (6) tests, (7) seed command, README and curl examples.
+- Use DRF class-based views only (generics like ListAPIView / ListCreateAPIView, and APIView for action endpoints). No function-based @api_view.
+- Never use fields = "__all__". Always list fields explicitly.
+- Do not implement authentication now (JWT will be added later). Set DEFAULT_PERMISSION_CLASSES to AllowAny and keep views free of any auth logic.
+- Dependencies: only Django (latest stable LTS), djangorestframework and Pillow. Pin them in requirements.txt. Create and use a virtualenv (.venv).
+- All user-facing error messages must be in Persian.
+- If something in this spec is ambiguous or contradictory, stop and ask instead of guessing.
+
+## 1. Scaffold
+- Django project named config, SQLite database, apps catalog and inventory.
+- Settings: INSTALLED_APPS (rest_framework + both apps), TIME_ZONE="Asia/Tehran", USE_TZ=True, MEDIA_URL="/media/", MEDIA_ROOT=BASE_DIR/"media", ALLOWED_HOSTS=["*"] (development only, add a comment), REST_FRAMEWORK={"DEFAULT_PERMISSION_CLASSES": ["rest_framework.permissions.AllowAny"]}. A development SECRET_KEY with a comment is fine.
+- Root urls: path("admin/", ...), path("catalog/", include("catalog.urls")), path("inventory/", include("inventory.urls")), plus media serving in DEBUG.
+- .gitignore: .vepycachehe__, db.sqlite3, media/.
+- Register models in the Django admin so products (with image upload), suppliers and loads can be managed by hand. Load admin: list_display id, product, label, finished_at; filter by product and by whether finished_at is null.
+
+## 2. Models
+Product (app catalog):
+- name (CharField), tare_weight (DecimalField, default 0), image (ImageField, upload_to="products/", blank=True), image_updated_at (DateTimeField, null=True, editable=False), updated_at (DateTimeField, auto_now=True).
+- Override save(): set image_updated_at = now only when the image file actually changed (or was set for the first time).
+
+Placeholders (app inventory), kept minimal because the receipts and accounting tabs come later; do NOT build endpoints for them:
+- Supplier: name (CharField).
+- GoodsReceipt: created_at (auto_now_add).
+
+Load (app inventory):
+- receipt (FK to GoodsReceipt, null=True, blank=True, on_delete=SET_NULL), status (choices pending/matched, default pending), supplier (FK to Supplier, null=True, blank=True, on_delete=SET_NULL), product (FK to catalog.Product, on_delete=PROTECT), label (CharField max_length=50, blank=True, default="" and NEVER null), weight (DecimalField) / rate (IntegerField) / quantity (IntegerField) / arrived_at (DateField), all null=True, blank=True, finished_at (DateTimeField, null=True, blank=True; null means the load is still available), created_at (auto_now_add), updated_at (auto_now).
+- There is NO separate AvailableLoad model. A load is "available" when finished_at is NULL.
+- Add a partial UniqueConstraint on (product, label) with condition Q(finished_at__isnull=True), named "uniq_available_product_label". Meaning: among available loads, a product cannot have two loads with the same label (two empty labels also conflict). Finished loads are history and are excluded from the constraint.
+- Label helper: strip whitespace, collapse repeated spaces, and normalize Arabic characters to Persian (ي -> ی, ك -> ک) before validating or saving any label.
+
+## 3. Endpoints
+
+### GET /catalog/products/
+Plain list (no pagination): [{id, name, image_url, updated_at}], ordered by -updated_at then name.
+image_url is an absolute URL built from the request, with "?v=<int timestamp of image_updated_at, or 0>" appended; null when the product has no image. The "?v=" value must come from image_updated_at, NOT from updated_at, because the Android app uses it as an image cache key.
+
+### GET /inventory/loads/?available=true
+Plain list (no pagination): [{id, product, product_name, label}], ordered by product name then id, using select_related. With available=true return only loads where finished_at is NULL. Without the parameter return all loads.
+
+### POST /inventory/loads/  -> 201
+Body: {"product": <id>, "label": "<optional>", "existing_labels": [{"id": <load id>, "label": "<text>"}] (optional)}
+Response: the created load in the same shape as the list item.
+Business rules (the server decides; do not count "attempts", look at current state):
+- Let E = available loads of that product, and U = the subset of E whose label is "".
+- The set of ids in existing_labels must be EXACTLY the set of ids in U (no more, no fewer, no duplicates). Otherwise respond 409 with code "stale_state" (the client's view is outdated and it must refetch).
+- If E is empty: label is optional (default ""), existing_labels must be empty.
+- If E is not empty: the new load's label is required (non-blank), and all final labels (existing labeled loads + submitted existing_labels + the new label) must be non-blank and distinct; otherwise respond 400 with a field error on "label".
+- Everything runs inside one transaction.atomic(): update the labels of the existing loads (queryset .update() together with updated_at), create the new Load (status stays "pending"), and touch the product with Product.objects.filter(pk=...).update(updated_at=now) so that recently used products come first in the catalog list.
+- If an IntegrityError is raised (race condition caught by the DB constraint), respond 409 "stale_state".
+
+### POST /inventory/loads/{id}/finish/  -> 200
+Set finished_at = now and updated_at = now ONLY if finished_at is currently NULL. It must be idempotent: finishing an already finished load returns 200 with the load and changes nothing. Return 404 only if the id never existed. Return the load in the list-item shape.
+
+### POST /inventory/loads/{id}/restore/  -> 200
+Set finished_at = NULL (and updated_at) only if it is currently set. Idempotent: restoring an already available load returns 200. If the DB rejects it because of the partial unique constraint (another available load with the same product and label), respond 409 with code "restore_conflict" and a Persian message saying another load with the same label exists. Wrap the update in transaction.atomic() and catch IntegrityError.
+
+### Error body for 409
+Every 409 must have the shape {"code": "stale_state" | "restore_conflict", "detail": "<Persian message>"} so the mobile app can branch on code. Implement this cleanly (custom APIException subclasses plus a small exception handler, or equivalent).
+
+## 4. Tests (APITestCase) — all must pass
+- First load of a product without label -> 201, label == "".
+- Second POST without existing_labels while the first has no label -> 409 stale_state.
+- Second POST with new label + existing_labels for the unlabeled first load -> 201; both labels saved.
+- Third POST with only a new label -> 201.
+- Duplicate label for the same product -> 400.
+- Same label on a different product -> 201.
+- Missing label when E is not empty -> 400.
+- existing_labels containing a wrong or extra id -> 409.
+- Arabic and Persian variants of the same label (ي/ی, ك/ک) are treated as duplicates.
+- finish: first call 200, second call 200 (finished_at unchanged), unknown id -> 404.
+- After finish, a new load with the same label is accepted (constraint is partial).
+
+- restore: 409 restore_conflict while a same-label available load exists; 200 after that one is finished; restoring an available load -> 200.
+- Product.updated_at is touched after a load is created, and the catalog list returns that product first.
+- image_url contains "?v=" derived from image_updated_at; changing the image changes the value; changing only the name does not.
+- available=true filters finished loads out.
+- A DB-level test proving the partial unique constraint rejects two available loads with the same (product, label), including two empty labels.
+
+## 5. Seed command, README and final deliverable
+- Management command seed_demo creating about 12 products (e.g. خیار، گوجه، موز، سیب، پیاز، هویج، ...) without images. It must be safe to run twice.
+- README.md with: setup steps (venv, install, migrate, createsuperuser, seed_demo), how to run the server so an Android emulator can reach it (runserver 0.0.0.0:8000, emulator uses 10.0.2.2:8000), and curl examples for every endpoint including the 409 cases.
+- Final message: a short summary per step, the migration names, the test results, and any assumptions you made.
