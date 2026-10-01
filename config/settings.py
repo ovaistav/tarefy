@@ -119,6 +119,8 @@ USE_TZ = True
 REST_FRAMEWORK = {
     # Authentication is intentionally not wired up yet; JWT comes later.
     'DEFAULT_PERMISSION_CLASSES': ['rest_framework.permissions.AllowAny'],
+    # Renders every 409 as {"code": ..., "detail": "<Persian message>"}.
+    'EXCEPTION_HANDLER': 'config.api.api_exception_handler',
 }
 
 
