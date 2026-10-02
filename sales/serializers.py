@@ -170,11 +170,12 @@ class SaleLinePatchSerializer(serializers.Serializer):
 
 def _reject_empty_net(load, gross_weight, quantity, rate):
     """The net weight is derived, so it is reported as its own field error."""
-    net_weight, _ = line_amounts(load, gross_weight, quantity, rate)
+    net_weight, line_total = line_amounts(load, gross_weight, quantity, rate)
     if net_weight <= 0:
         raise serializers.ValidationError(
             {'net_weight': [_('وزن خالص باید بزرگ‌تر از صفر باشد.')]}
         )
+    return line_total
 
 
 class PorterageWriteSerializer(serializers.Serializer):
