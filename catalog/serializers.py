@@ -1,14 +1,40 @@
 from rest_framework import serializers
 
 from .models import Product
+from .validators import (
+    STICKER_MAX_LENGTH,
+    normalize_background,
+    validate_sticker,
+)
 
 
 class ProductSerializer(serializers.ModelSerializer):
     image_url = serializers.SerializerMethodField()
+    sticker = serializers.CharField(
+        max_length=STICKER_MAX_LENGTH,
+        required=False,
+        allow_blank=True,
+        validators=[validate_sticker],
+    )
+    background = serializers.CharField(
+        max_length=7, required=False, allow_blank=True
+    )
 
     class Meta:
         model = Product
-        fields = ['id', 'name', 'image_url', 'updated_at']
+        fields = [
+            'id',
+            'name',
+            'image_url',
+            'sticker',
+            'background',
+            'updated_at',
+        ]
+        read_only_fields = ['id', 'image_url', 'updated_at']
+
+    def validate_background(self, value):
+        # Stored canonically so the app can compare colors without parsing.
+        return normalize_background(value)
 
     def get_image_url(self, product):
         if not product.image:

@@ -1,10 +1,11 @@
-import io
+﻿import io
 import shutil
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
+from django.core.exceptions import ValidationError
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import override_settings
 from django.urls import reverse
@@ -125,3 +126,81 @@ class ProductImageTimestampTests(APITestCase):
         self.assertEqual(
             Product.objects.get(pk=product.pk).image_updated_at, second_time
         )
+
+
+class ProductStickerTests(APITestCase):
+    def setUp(self):
+        self.url = reverse('product-list')
+
+    def test_blank_sticker_is_allowed(self):
+        Product.objects.create(name='خیار')
+        self.assertEqual(Product.objects.get().sticker, '')
+
+    def test_allowed_characters_are_accepted(self):
+        Product.objects.create(name='خیار', sticker='cucumber_green-2')
+        self.assertEqual(Product.objects.get().sticker, 'cucumber_green-2')
+
+    def test_uppercase_is_rejected(self):
+        product = Product(name='خیار', sticker='Cucumber')
+        with self.assertRaises(ValidationError):
+            product.full_clean()
+
+    def test_persian_is_rejected(self):
+        product = Product(name='خیار', sticker='خیار')
+        with self.assertRaises(ValidationError):
+            product.full_clean()
+
+    def test_spaces_and_dots_are_rejected(self):
+        for sticker in ['a b', 'a.b', 'a/b']:
+            with self.subTest(sticker=sticker):
+                with self.assertRaises(ValidationError):
+                    Product(name='خیار', sticker=sticker).full_clean()
+
+    def test_too_long_sticker_is_rejected(self):
+        with self.assertRaises(ValidationError):
+            Product(name='خیار', sticker='a' * 41).full_clean()
+
+    def test_list_returns_the_sticker(self):
+        Product.objects.create(name='خیار', sticker='cucumber')
+        response = self.client.get(self.url)
+        self.assertEqual(response.data[0]['sticker'], 'cucumber')
+
+
+class ProductBackgroundTests(APITestCase):
+    def setUp(self):
+        self.url = reverse('product-list')
+
+    def test_blank_is_allowed(self):
+        Product.objects.create(name='خیار')
+        self.assertEqual(Product.objects.get().background, '')
+
+    def test_six_digit_hex_is_stored_uppercase(self):
+        Product.objects.create(name='خیار', background='#2E7D32')
+        self.assertEqual(Product.objects.get().background, '#2E7D32')
+
+    def test_hash_is_optional(self):
+        Product.objects.create(name='خیار', background='2e7d32')
+        self.assertEqual(Product.objects.get().background, '#2E7D32')
+
+    def test_three_digit_hex_is_expanded(self):
+        Product.objects.create(name='خیار', background='#abc')
+        self.assertEqual(Product.objects.get().background, '#AABBCC')
+
+    def test_surrounding_whitespace_is_ignored(self):
+        Product.objects.create(name='خیار', background='  #2E7D32  ')
+        self.assertEqual(Product.objects.get().background, '#2E7D32')
+
+    def test_invalid_values_are_rejected(self):
+        for value in ['red', '#12345', '#1234567', '#GGGGGG', 'rgb(1,2,3)']:
+            with self.subTest(value=value):
+                with self.assertRaises(ValidationError):
+                    Product(name='خیار', background=value).full_clean()
+
+    def test_list_returns_the_background(self):
+        Product.objects.create(name='خیار', background='#2e7d32')
+        response = self.client.get(self.url)
+        self.assertEqual(response.data[0]['background'], '#2E7D32')
+
+    def test_existing_rows_are_backfilled_to_blank(self):
+        product = Product.objects.create(name='پیاز')
+        self.assertEqual(self.client.get(self.url).data[0]['background'], '')
