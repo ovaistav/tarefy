@@ -13,7 +13,7 @@ class LoadListItemSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Load
-        fields = ['id', 'product', 'product_name', 'label']
+        fields = ['id', 'product', 'product_name', 'label', 'tare_weight']
 
 
 class ExistingLabelSerializer(serializers.Serializer):
@@ -77,4 +77,55 @@ class LoadCreateSerializer(serializers.Serializer):
         if errors:
             raise serializers.ValidationError(errors)
 
+        return attrs
+
+
+class LoadPatchSerializer(serializers.Serializer):
+    """Only the label and the basket weight of a load may change."""
+
+    product = serializers.PrimaryKeyRelatedField(
+        queryset=Product.objects.all(), required=False
+    )
+    label = serializers.CharField(
+        max_length=50, required=False, allow_blank=True, allow_null=True
+    )
+    tare_weight = serializers.DecimalField(
+        max_digits=8, decimal_places=3, required=False, min_value=0
+    )
+
+    def validate_label(self, value):
+        return normalize_text(value)
+
+    def to_internal_value(self, data):
+        # A plain Serializer silently drops keys it does not declare; a load
+        # only has two editable fields, so anything else is a client bug.
+        unknown = sorted(set(data) - set(self.fields))
+        if unknown:
+            raise serializers.ValidationError(
+                {field: [_('این فیلد قابل تغییر نیست.')] for field in unknown}
+            )
+        return super().to_internal_value(data)
+
+    def validate(self, attrs):
+        load = self.context['load']
+        product = attrs.get('product')
+        if product is not None and product.pk != load.product_id:
+            raise serializers.ValidationError(
+                {'product': [_('کالای بار قابل تغییر نیست.')]}
+            )
+
+        if 'label' in attrs:
+            label = attrs['label'] or ''
+            siblings = Load.objects.filter(
+                product_id=load.product_id, finished_at__isnull=True
+            ).exclude(pk=load.pk)
+            sibling_labels = set(siblings.values_list('label', flat=True))
+            errors = {}
+            if not label and siblings.exists():
+                # An unlabeled load is only acceptable while it is the only one.
+                errors['label'] = [_('برچسب همه بارهای موجود باید وارد شود.')]
+            elif label in sibling_labels:
+                errors['label'] = [_('برچسب بارهای یک کالا باید یکتا باشد.')]
+            if errors:
+                raise serializers.ValidationError(errors)
         return attrs

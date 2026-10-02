@@ -3,16 +3,7 @@ from django.db.models import Q
 
 from catalog.models import Product
 from config.text import normalize_text
-
-
-class Supplier(models.Model):
-    name = models.CharField(max_length=100)
-
-    class Meta:
-        ordering = ['name']
-
-    def __str__(self):
-        return self.name
+from parties.models import Party
 
 
 class GoodsReceipt(models.Model):
@@ -41,7 +32,7 @@ class Load(models.Model):
         max_length=10, choices=Status.choices, default=Status.PENDING
     )
     supplier = models.ForeignKey(
-        Supplier,
+        Party,
         null=True,
         blank=True,
         on_delete=models.SET_NULL,
@@ -51,6 +42,9 @@ class Load(models.Model):
         Product, on_delete=models.PROTECT, related_name='loads'
     )
     label = models.CharField(max_length=50, blank=True, default='')
+    # The basket weight of *this* load. Copied from the product on creation, so
+    # later product edits do not silently rewrite historical sales.
+    tare_weight = models.DecimalField(max_digits=8, decimal_places=3, default=0)
     weight = models.DecimalField(
         max_digits=12, decimal_places=3, null=True, blank=True
     )

@@ -1,4 +1,4 @@
-from django.test import TestCase
+﻿from django.test import TestCase
 from django.urls import reverse
 from rest_framework.test import APITestCase
 
@@ -305,3 +305,132 @@ class DatabaseConstraintTests(TestCase):
         )
         second = Load.objects.create(product=self.product, label='الف')
         self.assertIsNone(second.finished_at)
+
+
+class LoadTareWeightTests(APITestCase):
+    def setUp(self):
+        self.product = Product.objects.create(name='خیار', tare_weight='1.500')
+        self.url = reverse('load-list-create')
+
+    def test_tare_is_copied_from_the_product_on_creation(self):
+        response = self.client.post(
+            self.url, {'product': self.product.id, 'label': 'الف'}, format='json'
+        )
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.data['tare_weight'], '1.500')
+        self.assertEqual(
+            str(Load.objects.get(pk=response.data['id']).tare_weight), '1.500'
+        )
+
+    def test_changing_the_product_default_does_not_rewrite_existing_loads(self):
+        created = self.client.post(
+            self.url, {'product': self.product.id, 'label': 'الف'}, format='json'
+        )
+        Product.objects.filter(pk=self.product.pk).update(tare_weight='9.000')
+        # The load keeps the copy it was created with.
+        self.assertEqual(
+            str(Load.objects.get(pk=created.data['id']).tare_weight), '1.500'
+        )
+
+    def test_list_items_include_the_tare(self):
+        self.client.post(self.url, {'product': self.product.id}, format='json')
+        response = self.client.get(self.url)
+        self.assertEqual(
+            sorted(response.data[0].keys()),
+            ['id', 'label', 'product', 'product_name', 'tare_weight'],
+        )
+
+
+class LoadPatchTests(APITestCase):
+    def setUp(self):
+        self.product = Product.objects.create(name='خیار', tare_weight='1.000')
+        self.other = Product.objects.create(name='گوجه')
+        self.load = Load.objects.create(
+product=self.product, label='الف', tare_weight='1.000'
+        )
+        self.url = reverse('load-detail', args=[self.load.id])
+
+    def patch(self, **payload):
+        return self.client.patch(self.url, payload, format='json')
+
+    def test_label_is_normalized_and_returned_in_the_list_shape(self):
+        response = self.patch(label='  ب  الف ')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['label'], 'ب الف')
+        self.assertEqual(
+            sorted(response.data.keys()),
+            ['id', 'label', 'product', 'product_name', 'tare_weight'],
+        )
+
+    def test_tare_weight_can_be_changed(self):
+        response = self.patch(tare_weight='2.250')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['tare_weight'], '2.250')
+        self.assertEqual(
+            str(Load.objects.get(pk=self.load.id).tare_weight), '2.250'
+        )
+
+    def test_negative_tare_is_rejected(self):
+        self.assertEqual(self.patch(tare_weight='-1').status_code, 400)
+
+    def test_product_is_immutable(self):
+        response = self.patch(product=self.other.id)
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('product', response.data)
+        self.assertEqual(Load.objects.get(pk=self.load.id).product_id, self.product.id)
+
+    def test_resending_the_same_product_is_accepted(self):
+        response = self.patch(product=self.product.id, tare_weight='3')
+        self.assertEqual(response.status_code, 200)
+
+    def test_duplicate_label_among_available_loads_is_a_field_error(self):
+        Load.objects.create(product=self.product, label='ب')
+        response = self.patch(label='ب')
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('label', response.data)
+
+    def test_blank_label_is_allowed_when_it_is_the_only_available_load(self):
+        response = self.patch(label='')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['label'], '')
+
+    def test_blank_label_is_rejected_while_a_sibling_exists(self):
+        Load.objects.create(product=self.product, label='ب')
+        response = self.patch(label='')
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('label', response.data)
+
+    def test_label_can_repeat_a_finished_load_label(self):
+        Load.objects.create(
+            product=self.product, label='ب', finished_at='2026-01-01T10:00:00Z'
+        )
+        response = self.patch(label='ب')
+        self.assertEqual(response.status_code, 200)
+
+    def test_unknown_field_is_rejected(self):
+        self.assertEqual(self.patch(weight='5').status_code, 400)
+
+    def test_unknown_load_returns_404(self):
+        self.assertEqual(
+            self.client.patch(
+                reverse('load-detail', args=[999999]), {'label': 'ب'}, format='json'
+            ).status_code,
+            404,
+        )
+
+
+class LoadDeleteTests(APITestCase):
+    def setUp(self):
+        self.product = Product.objects.create(name='خیار')
+        self.load = Load.objects.create(product=self.product, label='الف')
+        self.url = reverse('load-detail', args=[self.load.id])
+
+    def test_delete_returns_204_and_removes_the_load(self):
+        response = self.client.delete(self.url)
+        self.assertEqual(response.status_code, 204)
+        self.assertFalse(Load.objects.filter(pk=self.load.id).exists())
+
+    def test_deleting_an_unknown_load_returns_404(self):
+        self.assertEqual(
+            self.client.delete(reverse('load-detail', args=[999999])).status_code, 404
+        )
