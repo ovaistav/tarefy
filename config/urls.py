@@ -8,6 +8,8 @@ urlpatterns = [
     path('catalog/', include('catalog.urls')),
     path('inventory/', include('inventory.urls')),
     path('accounting/', include('accounting.urls')),
+    # The sales urls already carry the "sales/" prefix.
+    path('', include('sales.urls')),
     # The party urls already carry the "parties/" prefix.
     path('', include('parties.urls')),
 ]
