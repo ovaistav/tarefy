@@ -7,6 +7,7 @@ urlpatterns = [
     path('admin/', admin.site.urls),
     path('catalog/', include('catalog.urls')),
     path('inventory/', include('inventory.urls')),
+    path('accounting/', include('accounting.urls')),
     # The party urls already carry the "parties/" prefix.
     path('', include('parties.urls')),
 ]
