@@ -1,23 +1,8 @@
-import re
-
 from django.db import models
 from django.db.models import Q
 
 from catalog.models import Product
-
-# Arabic letters that look identical to their Persian counterparts.
-ARABIC_TO_PERSIAN = {
-    'ي': 'ی',  # ARABIC YEH -> FARSI YEH
-    'ك': 'ک',  # ARABIC KAF -> KEHEH
-}
-
-
-def normalize_label(value):
-    """Normalize a load label: trim, collapse spaces, Arabic -> Persian."""
-    if value is None:
-        return ''
-    value = str(value).translate(str.maketrans(ARABIC_TO_PERSIAN))
-    return re.sub(r'\s+', ' ', value).strip()
+from config.text import normalize_text
 
 
 class Supplier(models.Model):
@@ -91,5 +76,5 @@ class Load(models.Model):
         return f'{self.product_id} / {self.label or "(no label)"}'
 
     def save(self, *args, **kwargs):
-        self.label = normalize_label(self.label)
+        self.label = normalize_text(self.label)
         super().save(*args, **kwargs)

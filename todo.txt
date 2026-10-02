@@ -1,86 +1,107 @@
-Build a complete Django + Django REST Framework backend FROM SCRATCH in the current empty directory. Do not assume any existing code. The backend serves the "inventory" tab of a vegetable seller's Android app. Follow the spec exactly and do not add features that are not listed.
+You are extending an EXISTING Django + Django REST Framework project (SQLite) that was built in an earlier session. It already has the apps catalog (Product) and inventory (Load, plus placeholder Supplier and GoodsReceipt), DRF class-based views, a custom 409 error format, a passing test-suite, and a seed_demo command. Do NOT rebuild anything. Extend it according to this spec and keep all existing behavior working unless this spec says otherwise.
 
 ## 0. Working rules
-- Start by listing your assumptions in a few lines, then work in small steps. After each step run python manage.py check, makemigrations, migrate and the tests (once they exist). Initialize a git repo and make one clear commit per step.
-- Steps in order: (1) project scaffold, (2) catalog app and Product, (3) inventory app and models, (4) catalog endpoint, (5) inventory endpoints, (6) tests, (7) seed command, README and curl examples.
-- Use DRF class-based views only (generics like ListAPIView / ListCreateAPIView, and APIView for action endpoints). No function-based @api_view.
-- Never use fields = "__all__". Always list fields explicitly.
-- Do not implement authentication now (JWT will be added later). Set DEFAULT_PERMISSION_CLASSES to AllowAny and keep views free of any auth logic.
-- Dependencies: only Django (latest stable LTS), djangorestframework and Pillow. Pin them in requirements.txt. Create and use a virtualenv (.venv).
-- All user-facing error messages must be in Persian.
-- If something in this spec is ambiguous or contradictory, stop and ask instead of guessing.
+- First read the existing code (models, serializers, views, urls, exception handler, label-normalization helper, tests) and run the existing tests to get a baseline. List your assumptions in a few lines before coding.
+- Work in small steps, run python manage.py check, makemigrations, migrate and the full test-suite after each step, and make one clear git commit per step. Steps: (1) shared helpers, (2) catalog changes, (3) inventory changes, (4) parties app, (5) accounting app, (6) sales models and migrations, (7) sales logic and endpoints, (8) admin, seed, settings, (9) tests, (10) final summary.
+- DRF class-based views only (generics or APIView). Never use fields = "__all__". No authentication yet: keep AllowAny and no auth logic in views.
+- Money: all amounts are integer RIAL stored in BigInteger fields. Never use floats anywhere. Weights are Decimal and are serialized as strings. Do NOT add any "step" or multiple-of validation on amounts, and no extra constraints beyond the sign rules written below.
+- All user-facing error messages are in Persian.
+- If something is ambiguous or contradicts existing code, stop and ask instead of guessing.
 
-## 1. Scaffold
-- Django project named config, SQLite database, apps catalog and inventory.
-- Settings: INSTALLED_APPS (rest_framework + both apps), TIME_ZONE="Asia/Tehran", USE_TZ=True, MEDIA_URL="/media/", MEDIA_ROOT=BASE_DIR/"media", ALLOWED_HOSTS=["*"] (development only, add a comment), REST_FRAMEWORK={"DEFAULT_PERMISSION_CLASSES": ["rest_framework.permissions.AllowAny"]}. A development SECRET_KEY with a comment is fine.
-- Root urls: path("admin/", ...), path("catalog/", include("catalog.urls")), path("inventory/", include("inventory.urls")), plus media serving in DEBUG.
-- .gitignore: .vepycachehe__, db.sqlite3, media/.
-- Register models in the Django admin so products (with image upload), suppliers and loads can be managed by hand. Load admin: list_display id, product, label, finished_at; filter by product and by whether finished_at is null.
+## 1. Shared helpers
+Create (or reuse and move) a small shared module with: normalize_text (trim, collapse whitespace, map Arabic ي to Persian ی and ك to ک) and normalize_digits (map Persian and Arabic-Indic digits to ASCII). Reuse the existing label helper; do not duplicate logic.
 
-## 2. Models
-Product (app catalog):
-- name (CharField), tare_weight (DecimalField, default 0), image (ImageField, upload_to="products/", blank=True), image_updated_at (DateTimeField, null=True, editable=False), updated_at (DateTimeField, auto_now=True).
-- Override save(): set image_updated_at = now only when the image file actually changed (or was set for the first time).
+## 2. catalog changes (Product)
+- Add sticker (CharField, blank, max 40, only [a-z0-9_-]; it is a key the Android app maps to a bundled sticker) and background (CharField, blank; a hex color, accepted as #RGB or #RRGGBB with or without "#", always stored normalized as uppercase #RRGGBB, validated).
+- tare_weight stays on Product and now means the DEFAULT basket weight for newly created loads.
+- GET /catalog/products/ additionally returns sticker and background.
 
-Placeholders (app inventory), kept minimal because the receipts and accounting tabs come later; do NOT build endpoints for them:
-- Supplier: name (CharField).
-- GoodsReceipt: created_at (auto_now_add).
+## 3. inventory changes (Load)
+- Add tare_weight (Decimal(8,3), default 0): the basket weight of this load. On creation the server copies it from the product (POST /inventory/loads/ keeps its current request body). A data migration backfills existing loads from their product.
+- Replace the placeholder Supplier model with the real parties.Party: Load.supplier becomes a nullable FK to Party (on_delete=SET_NULL) and Supplier is deleted. Migration order must be safe (dev data is null). Update admin, seed and tests that used Supplier.
+- GET /inventory/loads/ items now are {id, product, product_name, label, tare_weight}.
+- PATCH /inventory/loads/{id}/ accepts only label and tare_weight. The product is immutable (reject a changed product with 400). Label rules are the same as on creation: normalized; unique among AVAILABLE loads of that product (409 stale_state when the DB constraint fires, 400 field error on a clear duplicate); blank is allowed only when no other available load of the product exists. Return the load in the list-item shape.
+- DELETE /inventory/loads/{id}/ -> 204. If the load is referenced anywhere (InvoiceLine uses on_delete=PROTECT) catch ProtectedError and return 409 {"code": "in_use", "detail": "<Persian>"}.
+- finish and restore endpoints stay exactly as they are.
 
-Load (app inventory):
-- receipt (FK to GoodsReceipt, null=True, blank=True, on_delete=SET_NULL), status (choices pending/matched, default pending), supplier (FK to Supplier, null=True, blank=True, on_delete=SET_NULL), product (FK to catalog.Product, on_delete=PROTECT), label (CharField max_length=50, blank=True, default="" and NEVER null), weight (DecimalField) / rate (IntegerField) / quantity (IntegerField) / arrived_at (DateField), all null=True, blank=True, finished_at (DateTimeField, null=True, blank=True; null means the load is still available), created_at (auto_now_add), updated_at (auto_now).
-- There is NO separate AvailableLoad model. A load is "available" when finished_at is NULL.
-- Add a partial UniqueConstraint on (product, label) with condition Q(finished_at__isnull=True), named "uniq_available_product_label". Meaning: among available loads, a product cannot have two loads with the same label (two empty labels also conflict). Finished loads are history and are excluded from the constraint.
-- Label helper: strip whitespace, collapse repeated spaces, and normalize Arabic characters to Persian (ي -> ی, ك -> ک) before validating or saving any label.
+## 4. New app parties
+Party:
+- name and label (both required, normalized with normalize_text before saving), phone (nullable, digits normalized, spaces removed, no format validation), national_code (nullable; store NULL, never ""), commission (Decimal(5,2), default 10, range 0 to 100, it is a percent), description (TextField, blank), details (JSONField, default dict),
 
-## 3. Endpoints
+created_at, updated_at.
+- UniqueConstraint on (name, label) (values are normalized on save, so the DB constraint works on normalized values). Conditional UniqueConstraint on national_code when it is not null (many NULLs allowed).
+- national_code validator: digits normalized, exactly 10 digits, not all digits identical, and the Iranian checksum: s = sum(d[i] * (10 - i)) for i in 0..8, r = s mod 11; valid when (r < 2 and d[9] == r) or (r >= 2 and d[9] == 11 - r). Known valid examples for your tests: 0499370899 and 0012345679. Invalid: 0499370898 and 1111111111.
+- details validator: must be a dict of string keys to string values, at most 50 keys, key length at most 50, value length at most 500. The server never interprets the keys (bank account number, origin, etc. are suggestions that live only in the mobile app).
+Endpoints: GET /parties/?q= (plain list, no pagination; q is normalized and matched with icontains against name OR label; item shape {id, name, label}), POST /parties/, GET /parties/{id}/ (all fields), PATCH /parties/{id}/. No DELETE.
 
-### GET /catalog/products/
-Plain list (no pagination): [{id, name, image_url, updated_at}], ordered by -updated_at then name.
-image_url is an absolute URL built from the request, with "?v=<int timestamp of image_updated_at, or 0>" appended; null when the product has no image. The "?v=" value must come from image_updated_at, NOT from updated_at, because the Android app uses it as an image cache key.
+## 5. New app accounting
+Bank: name (unique, normalized). Placeholder: bank accounts will come later, so keep it minimal. GET /accounting/banks/ -> [{id, name}] ordered by name. Create banks through admin and seed only.
 
-### GET /inventory/loads/?available=true
-Plain list (no pagination): [{id, product, product_name, label}], ordered by product name then id, using select_related. With available=true return only loads where finished_at is NULL. Without the parameter return all loads.
+## 6. New app sales — models
+Sale: status (draft | credit | final, default draft), total_amount (BigInteger default 0, maintained by the server), finalized_at (null), created_by (nullable FK to the user model, unused for now), created_at, updated_at. Indexes on (status, -created_at, -id) and (-created_at, -id).
+Invoice: OneToOne(Sale, related_name="invoice"), buyer (FK Party, null, PROTECT), buyer_amount (signed BigInteger, default 0), created_at. buyer and buyer_amount are managed only through the account endpoint.
+InvoiceLine: invoice (FK), load (FK Load, on_delete=PROTECT), gross_weight Decimal(10,3), net_weight Decimal(10,3), quantity PositiveIntegerField, rate BigInteger, line_total BigInteger, created_at. Gross, net and line_total are all stored. Order by id.
+Porterage: OneToOne(Sale, related_name="porterage"), amount BigInteger default 0.
+Payment: sale (FK), method (pos | cheque | card_transfer | cash), bank (FK accounting.Bank, null, PROTECT), amount (positive BigInteger), created_at. Rule: bank is required for pos and card_transfer, and must be empty for cheque and cash.
+PorterageSettings: a single-row model (enforce the singleton): works_with_porters (bool, default True), rate_per_kg (BigInteger, default 4000), round_enabled (bool, default False). The rounding step is a constant PORTERAGE_ROUND_STEP = 50000.
+Creating a Sale always creates its Invoice and Porterage in the same transaction.
 
-### POST /inventory/loads/  -> 201
-Body: {"product": <id>, "label": "<optional>", "existing_labels": [{"id": <load id>, "label": "<text>"}] (optional)}
-Response: the created load in the same shape as the list item.
-Business rules (the server decides; do not count "attempts", look at current state):
-- Let E = available loads of that product, and U = the subset of E whose label is "".
-- The set of ids in existing_labels must be EXACTLY the set of ids in U (no more, no fewer, no duplicates). Otherwise respond 409 with code "stale_state" (the client's view is outdated and it must refetch).
-- If E is empty: label is optional (default ""), existing_labels must be empty.
-- If E is not empty: the new load's label is required (non-blank), and all final labels (existing labeled loads + submitted existing_labels + the new label) must be non-blank and distinct; otherwise respond 400 with a field error on "label".
-- Everything runs inside one transaction.atomic(): update the labels of the existing loads (queryset .update() together with updated_at), create the new Load (status stays "pending"), and touch the product with Product.objects.filter(pk=...).update(updated_at=now) so that recently used products come first in the catalog list.
-- If an IntegrityError is raised (race condition caught by the DB constraint), respond 409 "stale_state".
+## 7. Business rules (server is the authority)
+- net_weight = gross_weight - load.tare_weight * quantity. It must be > 0, otherwise 400 with a field error on the weight. gross_weight > 0, quantity >= 0, rate >= 0.
+- line_total = round_half_up(net_weight * rate) as an integer (Decimal with ROUND_HALF_UP).
+- Sale.total_amount = sum(line_total) + porterage.amount. Implement ONE service function that recalculates everything, called inside the same transaction after every mutation.
+- summary: total = total_amount, paid = sum of payments, accounted = invoice.buyer_amount, remaining = total - paid - accounted.
+- Porterage is based on GROSS weight and is incremental. On a line change: delta = round_half_up(change_in_gross * settings.rate_per_kg), where adding a line gives +gross, deleting gives -gross, and editing gives new_gross - old_gross (no change when only quantity or rate changed). new_amount = max(0, old_amount + delta). If settings.round_enabled, new_amount = round_porterage(new_amount). If works_with_porters is False, never change the amount. PUT /sales/{id}/porterage/ {amount} stores the given amount exactly (integer >= 0, no rounding) and it becomes the base for later deltas.
 
-### POST /inventory/loads/{id}/finish/  -> 200
-Set finished_at = now and updated_at = now ONLY if finished_at is currently NULL. It must be idempotent: finishing an already finished load returns 200 with the load and changes nothing. Return 404 only if the id never existed. Return the load in the list-item shape.
+- round_porterage(a): if a <= 0 return 0; r = floor((a + step/2) / step) * step; if r == 0 return step. Examples: 120000 -> 100000, 126000 -> 150000, 125000 -> 150000, 20000 -> 50000.
+- Any mutation of a sale that is not a draft (lines, payments, porterage, account) first flips it back to draft (status=draft, finalized_at=NULL) in the same transaction, and the response shows status "draft".
+- Finalize: requires at least one line (else 409 code "no_lines") and remaining == 0 (else 409 code "not_settled" and the body also contains "remaining"). On success status = "credit" when invoice.buyer_amount > 0, otherwise "final", and finalized_at = now. Finalizing an already finalized sale returns 200 and changes nothing.
+- Adding a line on, or moving a line to, a load that is finished (finished_at not null) -> 409 code "load_finished". Several lines on the same load are allowed. Existing lines on a load that was finished later are untouched.
+- Account (the single party who owes or is owed): PUT /sales/{id}/account/ {party, amount} where amount is a non-zero signed integer (positive means the party owes us, negative means we owe the party). It sets invoice.buyer and buyer_amount. DELETE clears them (buyer NULL, amount 0).
+- Every mutation takes a lock on the sale row (select_for_update inside transaction.atomic) to serialize concurrent edits.
+- Deleting a sale (top-level DELETE) is allowed only for drafts, otherwise 409 code "not_deletable"; it cascades to invoice, lines, porterage and payments.
 
-### POST /inventory/loads/{id}/restore/  -> 200
-Set finished_at = NULL (and updated_at) only if it is currently set. Idempotent: restoring an already available load returns 200. If the DB rejects it because of the partial unique constraint (another available load with the same product and label), respond 409 with code "restore_conflict" and a Persian message saying another load with the same label exists. Wrap the update in transaction.atomic() and catch IntegrityError.
+## 8. Sales endpoints
+List: GET /sales/?status=draft|credit|final&party=<id>&cursor=...
+- DRF CursorPagination subclass: page size 30, ordering ("-created_at", "-id"), response {next, previous, results}. An invalid status value -> 400. party filters on invoice.buyer.
+- Item: {id, status, total_amount, created_at, party: {id, name, label} or null (the buyer), products: [{id, sticker, background}]}. products are the distinct products of the sale's lines (line -> load -> product), in line order. The number of queries per page must be constant (use select_related and prefetch).
+Detail and actions (every create, update and nested delete returns the FULL sale detail; creates return 201, the rest 200):
+POST /sales/ (creates draft + invoice + porterage; 201), GET /sales/{id}/, DELETE /sales/{id}/ (204),
+POST /sales/{id}/lines/ {load, gross_weight, quantity, rate}, PATCH and DELETE /sales/{id}/lines/{lid}/ (PATCH may change the load),
+PUT /sales/{id}/porterage/ {amount},
+POST /sales/{id}/payments/ {method, bank, amount}, PATCH and DELETE /sales/{id}/payments/{pid}/,
+PUT and DELETE /sales/{id}/account/,
+POST /sales/{id}/finalize/,
+GET and PATCH /sales/porterage-settings/ (single object; rate_per_kg >= 0).
+Detail shape (this is an example; keys are exact, weights are strings):
+{"id": 42, "status": "draft", "total_amount": 44725000, "created_at": "...", "finalized_at": null,
+ "lines": [{"id": 1, "load": 12, "product": 3, "product_name": "سیب", "label": "درجه یک", "quantity": 5, "gross_weight": "103.500", "net_weight": "98.500", "rate": 450000, "line_total": 44325000}],
+ "porterage": {"amount": 400000},
+ "payments": [{"id": 3, "method": "pos", "bank": 1, "bank_name": "...", "amount": 20000000}],
+ "account": {"party": {"id": 7, "name": "رضایی", "label": "همسایه"}, "amount": 24725000},
+ "summary": {"total": 44725000, "paid": 20000000, "accounted": 24725000, "remaining": 0}}
+("account" is null when there is none.)
 
-### Error body for 409
-Every 409 must have the shape {"code": "stale_state" | "restore_conflict", "detail": "<Persian message>"} so the mobile app can branch on code. Implement this cleanly (custom APIException subclasses plus a small exception handler, or equivalent).
+## 9. Errors
+Reuse the existing 409 format {"code", "detail"}. New codes: in_use, not_deletable, load_finished, not_settled (also "remaining"), no_lines. Ordinary validation errors keep the standard DRF 400 field-error format.
 
-## 4. Tests (APITestCase) — all must pass
-- First load of a product without label -> 201, label == "".
-- Second POST without existing_labels while the first has no label -> 409 stale_state.
-- Second POST with new label + existing_labels for the unlabeled first load -> 201; both labels saved.
-- Third POST with only a new label -> 201.
-- Duplicate label for the same product -> 400.
-- Same label on a different product -> 201.
-- Missing label when E is not empty -> 400.
-- existing_labels containing a wrong or extra id -> 409.
-- Arabic and Persian variants of the same label (ي/ی, ك/ک) are treated as duplicates.
-- finish: first call 200, second call 200 (finished_at unchanged), unknown id -> 404.
-- After finish, a new load with the same label is accepted (constraint is partial).
+## 10. Admin, seed, settings
+- Register Party, Bank, Sale (with inline lines and payments, read-only computed fields) and PorterageSettings (no add or delete) in the admin.
 
-- restore: 409 restore_conflict while a same-label available load exists; 200 after that one is finished; restoring an available load -> 200.
-- Product.updated_at is touched after a load is created, and the catalog list returns that product first.
-- image_url contains "?v=" derived from image_updated_at; changing the image changes the value; changing only the name does not.
-- available=true filters finished loads out.
-- A DB-level test proving the partial unique constraint rejects two available loads with the same (product, label), including two empty labels.
+- Settings: add the new apps; register the cursor pagination class where it is used (no global default change).
+- Extend seed_demo (still safe to run twice): set sticker and background for the existing demo products (for example cucumber #2E7D32, tomato #C62828, banana #F9A825), create 3 banks, about 5 parties with labels, and the default PorterageSettings row.
 
-## 5. Seed command, README and final deliverable
-- Management command seed_demo creating about 12 products (e.g. خیار، گوجه، موز، سیب، پیاز، هویج، ...) without images. It must be safe to run twice.
-- README.md with: setup steps (venv, install, migrate, createsuperuser, seed_demo), how to run the server so an Android emulator can reach it (runserver 0.0.0.0:8000, emulator uses 10.0.2.2:8000), and curl examples for every endpoint including the 409 cases.
-- Final message: a short summary per step, the migration names, the test results, and any assumptions you made.
+## 11. Tests (APITestCase, all must pass, existing ones included)
+- Product: sticker/background validation and normalization; list returns them.
+- Load: tare copied from the product on creation; PATCH rules (product immutable, duplicate label, blank label with a sibling, tare change); DELETE -> 204, and 409 in_use when a line references it; finish and restore still work.
+- Party: normalization, unique (name,label) after normalization, national code checksum cases (valid, invalid, all-same digits, wrong length, Persian digits), unique national code with several NULLs allowed, commission range, details validation, search over name and label, no DELETE.
+- Sales lines: gross 103.500 with tare 1.000 x quantity 5 and rate 450000 gives net 98.500 and line_total 44325000; net <= 0 -> 400; finished load -> 409; the same load twice is allowed; PATCH recalculates; DELETE returns the full sale.
+- Porterage: add line adds delta; example 400000 + 66000 gives 450000 with rounding on; unrounded when rounding is off; delete subtracts and never goes below 0; edit applies only the weight difference; works_with_porters False leaves 0; manual PUT then a new line builds on the manual amount; round_porterage examples above (including the minimum step).
+- Settlement: summary math, including cash 1500 plus account -500 for a total of 1000 giving remaining 0; payment bank rules per method; account PUT and DELETE set and clear buyer; finalize success gives final or credit depending on the sign of buyer_amount; 409 no_lines; 409 not_settled with remaining; finalize twice is idempotent.
+- Reopen: editing a finalized sale flips it to draft; merely reading it does not.
+- Deletion: a draft can be deleted (cascade); a non-draft gives 409 not_deletable.
+- Sales list: order is -created_at then -id; status and party filters; invalid status gives 400; stickers are distinct and in line order; the number of queries is constant for 1 and 25 sales (assertNumQueries); cursor pagination shows no duplicate or skipped item when a new sale is created between two page requests.
+- PorterageSettings: singleton, GET and PATCH, rate_per_kg >= 0.
+
+## 12. Final deliverable
+A short summary per step, the migration names (note the Supplier removal and the tare backfill), the test results, the assumptions you made, and curl examples for every new or changed endpoint (including the 409 cases).

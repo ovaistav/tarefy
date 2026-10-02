@@ -3,8 +3,9 @@ from rest_framework import serializers
 
 from catalog.models import Product
 from config.api import StaleStateConflict
+from config.text import normalize_text
 
-from .models import Load, normalize_label
+from .models import Load
 
 
 class LoadListItemSerializer(serializers.ModelSerializer):
@@ -30,11 +31,11 @@ class LoadCreateSerializer(serializers.Serializer):
     existing_labels = ExistingLabelSerializer(many=True, required=False)
 
     def validate_label(self, value):
-        return normalize_label(value)
+        return normalize_text(value)
 
     def validate_existing_labels(self, value):
         return [
-            {'id': item['id'], 'label': normalize_label(item.get('label'))}
+            {'id': item['id'], 'label': normalize_text(item.get('label'))}
             for item in value
         ]
 
