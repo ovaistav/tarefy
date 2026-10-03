@@ -14,10 +14,10 @@ from .views import (
 )
 
 urlpatterns = [
-    # The settings url already carries its own path, so it comes before the
-    # <int:pk> pattern for readability.
+    path('sales/', SaleListCreateView.as_view(), name='sale-list-create'),
+    # Declared before the <int:pk> patterns so the intent stays obvious.
     path(
-        'porterage-settings/',
+        'sales/porterage-settings/',
         PorterageSettingsView.as_view(),
         name='porterage-settings',
     ),

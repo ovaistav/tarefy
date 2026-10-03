@@ -1,10 +1,11 @@
 # Inventory backend
 
-Django + Django REST Framework backend for the **inventory** tab of the vegetable
-seller's Android app.
+Django + Django REST Framework backend for the **inventory**, **sales** and
+**parties** tabs of the vegetable seller's Android app.
 
 - No authentication yet (JWT comes later); every endpoint is open.
 - All user-facing error messages are in Persian.
+- All money is an integer number of Rial in a `BigInteger`; no floats anywhere.
 - SQLite for development.
 
 ## Setup
@@ -21,7 +22,7 @@ pip install -r requirements.txt
 
 python manage.py migrate
 python manage.py createsuperuser
-python manage.py seed_demo        # 12 demo products, safe to run twice
+python manage.py seed_demo        # 12 products, 3 banks, 5 parties; safe to run twice
 ```
 
 Run the tests:
@@ -48,13 +49,44 @@ python manage.py runserver 0.0.0.0:8000
 
 ## Endpoints
 
+### Catalog and inventory
+
 | Method | Path | Purpose |
 | --- | --- | --- |
 | GET | `/catalog/products/` | Product list, no pagination |
 | GET | `/inventory/loads/?available=true` | Load list; `available=true` hides finished loads |
 | POST | `/inventory/loads/` | Create a load (201) |
+| PATCH | `/inventory/loads/{id}/` | Change `label` and `tare_weight` only |
+| DELETE | `/inventory/loads/{id}/` | Delete a load (204), or 409 `in_use` |
 | POST | `/inventory/loads/{id}/finish/` | Mark a load finished (idempotent, 200) |
 | POST | `/inventory/loads/{id}/restore/` | Make a load available again (idempotent, 200) |
+
+### Parties and accounting
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| GET | `/parties/?q=` | Party list `{id, name, label}`, no pagination; `q` matches name **or** label |
+| POST | `/parties/` | Create a party (201) |
+| GET | `/parties/{id}/` | Full party |
+| PATCH | `/parties/{id}/` | Update a party |
+| GET | `/accounting/banks/` | `[{id, name}]` by name; read only |
+
+### Sales
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| GET | `/sales/?status=&party=&cursor=` | Cursor-paginated list, 30 per page |
+| POST | `/sales/` | Create a draft with its invoice and porterage (201) |
+| GET | `/sales/{id}/` | Full sale detail |
+| DELETE | `/sales/{id}/` | Delete a draft (204), or 409 `not_deletable` |
+| POST | `/sales/{id}/lines/` | Add a line (201, full sale) |
+| PATCH / DELETE | `/sales/{id}/lines/{lid}/` | Change (may move the load) or remove a line (full sale) |
+| PUT | `/sales/{id}/porterage/` | Set the porterage amount exactly |
+| POST | `/sales/{id}/payments/` | Add a payment (201, full sale) |
+| PATCH / DELETE | `/sales/{id}/payments/{pid}/` | Change or remove a payment (full sale) |
+| PUT / DELETE | `/sales/{id}/account/` | Set or clear the single account party |
+| POST | `/sales/{id}/finalize/` | Close the sale (200) |
+| GET / PATCH | `/sales/porterage-settings/` | The single porterage settings row |
 
 Every `409` has the same shape so the app can branch on `code`:
 
@@ -62,8 +94,17 @@ Every `409` has the same shape so the app can branch on `code`:
 { "code": "stale_state", "detail": "وضعیت بارها تغییر کرده است. لطفاً دوباره تلاش کنید." }
 ```
 
-`code` is either `stale_state` (the client's view is outdated — refetch) or
-`restore_conflict` (another available load already holds that label).
+`code` is one of:
+
+| Code | Meaning |
+| --- | --- |
+| `stale_state` | The client's view of the loads is outdated — refetch. |
+| `restore_conflict` | Another available load already holds that label. |
+| `in_use` | The load is on an invoice line and cannot be deleted. |
+| `not_deletable` | Only a draft sale can be deleted. |
+| `load_finished` | The load is finished and can no longer be sold. |
+| `not_settled` | Finalize was refused; the body also carries `remaining`. |
+| `no_lines` | Finalize was refused because the sale has no lines. |
 
 ## curl examples
 
@@ -108,9 +149,45 @@ curl -s "$BASE/inventory/loads/"
 
 ```json
 [
-  { "id": 1, "product": 1, "product_name": "خیار", "label": "الف" },
-  { "id": 2, "product": 1, "product_name": "خیار", "label": "ب" }
+  { "id": 1, "product": 1, "product_name": "خیار", "label": "الف", "tare_weight": "0.000" },
+  { "id": 2, "product": 1, "product_name": "خیار", "label": "ب", "tare_weight": "0.000" }
 ]
+```
+
+### Update a load
+
+Only `label` and `tare_weight` may change; the product is immutable.
+
+```bash
+curl -s -X PATCH $BASE/inventory/loads/1/ \
+  -H 'Content-Type: application/json' \
+  -d '{"label": "  ب   الف ", "tare_weight": "1.000"}'
+```
+
+```json
+{ "id": 1, "product": 1, "product_name": "خیار", "label": "ب الف", "tare_weight": "1.000" }
+```
+
+Moving a load to another product is a `400`:
+
+```json
+{ "product": ["کالای بار قابل تغییر نیست."] }
+```
+
+A blank label is only allowed while the load is the only available one of its
+product; otherwise the creation rules apply — a `400` field error on a clear
+duplicate, `409 stale_state` when the database constraint wins the race.
+
+### Delete a load
+
+```bash
+curl -s -X DELETE $BASE/inventory/loads/1/     # 204, no body
+```
+
+Once the load is on an invoice line it is history:
+
+```json
+{ "code": "in_use", "detail": "این بار در یک فروش استفاده شده است و قابل حذف نیست." }
 ```
 
 ### Create a load
@@ -124,7 +201,7 @@ curl -s -X POST $BASE/inventory/loads/ \
 ```
 
 ```json
-{ "id": 1, "product": 1, "product_name": "خیار", "label": "" }
+{ "id": 1, "product": 1, "product_name": "خیار", "label": "", "tare_weight": "0.000" }
 ```
 
 A second load while the first one is still unlabeled must be rejected, because the
@@ -151,7 +228,7 @@ curl -s -X POST $BASE/inventory/loads/ \
 ```
 
 ```json
-{ "id": 2, "product": 1, "product_name": "خیار", "label": "ب" }
+{ "id": 2, "product": 1, "product_name": "خیار", "label": "ب", "tare_weight": "0.000" }
 ```
 
 Once every available load has a label, the next POST carries only a new label:
@@ -195,7 +272,7 @@ curl -s -X POST $BASE/inventory/loads/9999/finish/ # 404
 ```
 
 ```json
-{ "id": 1, "product": 1, "product_name": "خیار", "label": "الف" }
+{ "id": 1, "product": 1, "product_name": "خیار", "label": "الف", "tare_weight": "0.000" }
 ```
 
 Because finished loads are history, a finished load's label can be reused by a new
@@ -219,10 +296,18 @@ curl -s -X POST $BASE/inventory/loads/1/restore/
 ```
 
 ```json
-{ "id": 1, "product": 1, "product_name": "خیار", "label": "الف" }
+{ "id": 1, "product": 1, "product_name": "خیار", "label": "الف", "tare_weight": "0.000" }
 ```
 
 ## Notes for the Android client
+
+### Catalog
+
+- `sticker` is a key into an asset the app ships with (`[a-z0-9_-]`, max 40).
+- `background` is a hex color; `#RGB` and `#RRGGBB` are accepted, with or without
+  the `#`, and always come back as uppercase `#RRGGBB`.
+
+### Loads
 
 - Labels are normalized on the server: trimmed, internal whitespace collapsed, and
   Arabic `ي`/`ك` converted to Persian `ی`/`ک`. `"يک"` and `"یک"` are the same label.
@@ -230,13 +315,46 @@ curl -s -X POST $BASE/inventory/loads/1/restore/
   "available load" model.
 - Among available loads a product cannot have two loads with the same label — two
   empty labels conflict too. Finished loads are excluded from the rule.
+- Creating a load copies `Product.tare_weight` into `Load.tare_weight`, so a later
+  change to the product default never rewrites an existing load.
 - Creating a load touches the product's `updated_at`, which moves that product to
   the front of `/catalog/products/`.
 - When a POST races another request, the database constraint turns it into a `409`
   `stale_state`; retry after refetching.
 
+### Parties
+
+- `name` and `label` together are unique, and both are normalized before saving, so
+  `"رضايي"` and `"رضایی"` can never become two parties.
+- `national_code` is stored as `NULL` (never `""`) when absent, which is why many
+  parties may lack one. When present it is validated with the official Iranian
+  checksum.
+- `details` is a free-form map of short strings to short strings (max 50 keys, key
+  length 50, value length 500). The server never interprets the keys — bank account
+  number, origin and friends live in the app.
+- There is no `DELETE`: parties are never removed.
+
+### Sales
+
+- The server is the authority. The client sends weights, quantities and rates; the
+  server returns `net_weight`, `line_total`, `total_amount` and `summary`.
+- `net_weight = gross_weight - load.tare_weight * quantity` and must be above zero.
+- `total_amount = sum(line_total) + porterage.amount`.
+- `remaining = total_amount - paid - account`. A sale can only be finalized once
+  `remaining` is zero.
+- Porterage follows the **gross** weight and moves incrementally: adding a line
+  adds its whole gross weight, removing subtracts it, and editing applies only the
+  difference. Changing just a quantity or a rate leaves it alone. With
+  `works_with_porters` off the server never touches it.
+- Any edit to a finalized sale flips it back to `draft` in the same transaction.
+  Reading a sale never does.
+- Every mutation locks the sale row, so concurrent edits serialize instead of
+  interleaving.
+
 ## Admin
 
-`/admin/` can manage products (with image upload), suppliers, goods receipts and
-loads by hand. The loads list can be filtered by product and by whether the load is
-finished.
+`/admin/` can manage products (with image upload), parties, banks, sales (with
+their invoice, lines and payments) and the porterage settings by hand. The loads
+list can be filtered by product and by whether the load is finished. The porterage
+settings row can neither be added nor deleted — `seed_demo` or the first API read
+creates it.

@@ -926,6 +926,10 @@ class PorterageSettingsEndpointTests(SalesTestCase):
         super().setUp()
         self.url = reverse('porterage-settings')
 
+    def test_the_endpoint_is_mounted_under_sales(self):
+        self.assertEqual(self.url, '/sales/porterage-settings/')
+        self.assertEqual(self.client.get('/sales/porterage-settings/').status_code, 200)
+
     def test_get_returns_the_singleton(self):
         response = self.client.get(self.url)
         self.assertEqual(response.status_code, 200)
