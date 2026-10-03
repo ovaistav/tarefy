@@ -1,0 +1,564 @@
+================================================================================
+                        SESSION 2 DELIVERY REPORT
+   Django + DRF backend: catalog, inventory, parties, accounting, sales
+================================================================================
+
+Project       : D:\test
+Specification : todo.txt (107 lines, 10 steps) - EXTENSION of the session-1 build
+Date          : 2026-10-03
+Baseline      : 21ed239 "Add delivery report" (session 1, 35 tests)
+Status        : COMPLETE - 10/10 steps delivered, 196/196 tests passing,
+                          no pending migrations, working tree clean
+
+Scope of this session: session 1 delivered the inventory tab. This session
+extended that backend with three new apps (parties, accounting, sales), two
+catalog fields, a heavier load contract, and a full sales ledger with server-side
+money math. Nothing from session 1 was rebuilt; all 35 original tests still pass
+untouched.
+
+
+================================================================================
+1. EXECUTIVE SUMMARY
+================================================================================
+
+The headline of this session is a shift in what the server is responsible for.
+Session 1 was CRUD plus a concurrency contract. This session makes the server the
+accounting authority: the client never sends a computed number, and every
+mutation recalculates the truth from the database inside its own transaction.
+
+Four decisions carry most of the weight:
+
+  1. ONE RECALCULATION FUNCTION, CALLED INSIDE EVERY TRANSACTION.
+     sales/services.py holds every derived number - net_weight, line_total,
+     total_amount, porterage, summary. Each endpoint opens a transaction, takes
+     a row lock, mutates, then calls refresh_totals(sale) before committing.
+     There is no second code path that writes total_amount, so the total cannot
+     drift from the lines that justify it.
+
+  2. EVERY MUTATION LOCKS THE SALE ROW. locked_sale() wraps
+     select_for_update() in transaction.atomic(). Two phones editing one sale
+     serialize instead of interleaving, which matters because porterage is
+     INCREMENTAL (see below) and a lost update would silently corrupt it.
+
+  3. PORTERAGE IS A DELTA, NEVER A RECOMPUTATION. It follows GROSS weight
+     incrementally: +gross on add, -gross on delete, (new - old) on edit, and
+     nothing at all when only a quantity or a rate changed. This is why the row
+     lock is not optional. Recomputing from scratch would also have been
+     wrong, because a porter may set a manual amount that later deltas build on.
+
+  4. DATABASE CONSTRAINTS REMAIN THE AUTHORITY. Unique (name,label) on Party,
+     conditional unique national_code, conditional unique (product,label) on
+     available loads. Application checks produce readable Persian errors early;
+     the constraint settles races at COMMIT time and is translated into the
+     same status code.
+
+Money is integer Rial in BigInteger fields throughout. Weights are Decimal and
+serialize as strings ("98.500"). No float appears anywhere in the money path.
+
+
+================================================================================
+2. WHAT WAS BUILT, STEP BY STEP
+================================================================================
+
+--------------------------------------------------------------------------------
+Step 1  5ebb5e3  Shared text normalization
+--------------------------------------------------------------------------------
+config/text.py: normalize_text (trim, collapse whitespace, Arabic yeh/kaf ->
+Persian) and normalize_digits (Persian U+06F0..U+06F9 and Arabic-Indic
+U+0660..U+0669 -> ASCII).
+
+The existing inventory.normalize_label() was DELETED and its call sites moved to
+normalize_text, so there is exactly one implementation. The spec's instruction
+"reuse the existing label helper; do not duplicate logic" was read as "move it
+into the shared module and extend it", which is what happened.
+
+--------------------------------------------------------------------------------
+Step 2  a1012d8  parties app  (built 2nd, not 4th - see section 3)
+--------------------------------------------------------------------------------
+Party: name, label (both required, normalized on save), phone (nullable, digits
+normalized, spaces stripped, no format validation), national_code (nullable,
+stored as NULL and never ""), commission Decimal(5,2) default 10 range 0-100,
+description, details JSONField(default dict), created_at, updated_at.
+
+  - UniqueConstraint (name, label). Because both are normalized inside save(),
+    the constraint compares canonical values, so "رضايي" and "رضایی" can never
+    become two parties.
+  - Conditional UniqueConstraint on national_code where it is not null, so any
+    number of parties may lack one.
+  - national_code validator: digits normalized, exactly 10 digits, not all
+    identical, then the official checksum
+        s = sum(d[i] * (10 - i)) for i in 0..8;  r = s mod 11
+        valid when (r < 2 and d[9] == r) or (r >= 2 and d[9] == 11 - r)
+  - details validator: dict of str->str, <=50 keys, key <=50 chars, value <=500
+    chars. The server never interprets the keys.
+
+Endpoints: GET /parties/?q= (plain list, no pagination, q normalized then
+icontains against name OR label), POST, GET/PATCH /parties/{id}/. No DELETE.
+
+--------------------------------------------------------------------------------
+Step 3  c3ef2f8  catalog: sticker + background
+--------------------------------------------------------------------------------
+Product.sticker  CharField(40, blank), validated against ^[a-z0-9_-]*$, a key the
+                 Android app maps to a bundled asset.
+Product.background CharField(7, blank), #RGB or #RRGGBB with or without '#',
+                 always STORED as uppercase #RRGGBB (#abc -> #AABBCC, 2e7d32 ->
+                 #2E7D32). catalog/validators.py holds both normalizers; the
+                 model field validator and the Model.save() hook raise the same
+                 Persian message, so admin and API behave identically.
+GET /catalog/products/ now returns sticker and background.
+Product.tare_weight is unchanged and now documented as the DEFAULT basket weight.
+
+--------------------------------------------------------------------------------
+Step 4  22f1aec  inventory: tare_weight, Party FK, PATCH, DELETE
+--------------------------------------------------------------------------------
+Load.tare_weight Decimal(8,3) default 0 - the basket weight OF THIS LOAD. On
+creation the server copies Product.tare_weight into it, so editing the product
+default later never rewrites an existing load. A data migration backfills it.
+
+Load.supplier becomes a nullable FK to parties.Party (SET_NULL); the placeholder
+Supplier model is DELETED.
+
+GET /inventory/loads/ items are now
+    {id, product, product_name, label, tare_weight}
+
+PATCH /inventory/loads/{id}/ accepts ONLY label and tare_weight:
+  - product is immutable; a changed product is a 400
+    {"product": ["کالای بار قابل تغییر نیست."]}
+  - unknown fields are REJECTED, not ignored. A plain DRF Serializer silently
+    drops keys it does not declare, so to_internal_value() is overridden to
+    refuse them. "accepts only label and tare_weight" is enforced, not assumed.
+  - label follows the creation rules: normalized, unique among AVAILABLE loads of
+    that product (400 on a clear duplicate, 409 stale_state when the constraint
+    fires), and blank only when no other available load of the product exists.
+  - responds in the list-item shape.
+
+DELETE /inventory/loads/{id}/ -> 204. If any InvoiceLine references the load,
+ProtectedError is caught and returned as
+    {"code": "in_use", "detail": "این بار در یک فروش استفاده شده است و قابل حذف نیست."}
+finish and restore are untouched.
+
+--------------------------------------------------------------------------------
+Step 5  f7feb56  accounting app
+--------------------------------------------------------------------------------
+Bank: name only, unique, normalized. Deliberately minimal - bank accounts come
+later. GET /accounting/banks/ returns [{id, name}] ordered by name and is
+read-only (POST -> 405); banks are created through admin or seed_demo.
+
+--------------------------------------------------------------------------------
+Step 6  edd70b7  sales models
+--------------------------------------------------------------------------------
+Sale         status draft|credit|final (default draft), total_amount BigInteger
+             (server-maintained), finalized_at null, created_by null FK to the
+             user model (unused; auth comes later), created_at, updated_at.
+             Indexes on (status, -created_at, -id) and (-created_at, -id).
+Invoice      OneToOne(Sale, related_name="invoice"), buyer FK Party null PROTECT,
+             buyer_amount SIGNED BigInteger, created_at.
+InvoiceLine  invoice FK, load FK Load PROTECT, gross_weight, net_weight,
+             quantity, rate, line_total - all stored. Ordered by id.
+Porterage    OneToOne(Sale, related_name="porterage"), amount.
+Payment      sale FK, method pos|cheque|card_transfer|cash, bank FK null PROTECT,
+             amount positive. bank required for pos and card_transfer, must be
+             empty for cheque and cash.
+PorterageSettings  single row, enforced: save() forces pk=1 and delete() raises
+             ValueError. works_with_porters (default True), rate_per_kg (default
+             4000), round_enabled (default False). PORTERAGE_ROUND_STEP = 50000.
+
+Creating a Sale always creates its Invoice and Porterage in the same transaction.
+
+--------------------------------------------------------------------------------
+Step 7  6d5e5ad  sales logic and every endpoint
+--------------------------------------------------------------------------------
+sales/services.py is the only place the money and weight math lives:
+
+    round_half_up(v)      Decimal -> int Rial, halves away from zero (0.5 -> 1)
+    round_porterage(a)    a <= 0 -> 0;
+                          floor((a + step/2)/step)*step in integer arithmetic,
+                          and if that is 0 return one full step
+                          (120000->100000, 126000->150000, 125000->150000,
+                           20000->50000)
+    line_amounts(...)     net = gross - load.tare_weight * quantity
+                          (must be > 0), line_total = round_half_up(net * rate)
+    apply_porterage_delta  incremental on GROSS weight; never touches the amount
+                          when works_with_porters is False
+    refresh_totals(sale)  total_amount = sum(line_total) + porterage.amount
+    sale_summary(sale)    total, paid = sum(payments),
+                          accounted = invoice.buyer_amount,
+                          remaining = total - paid - accounted
+    locked_sale(pk)       select_for_update() inside transaction.atomic()
+
+Rules implemented as specified: any mutation of a non-draft flips it back to
+draft with finalized_at NULL in the same transaction; finalize needs >=1 line
+(409 no_lines) and remaining == 0 (409 not_settled, body also carries
+"remaining"), then status = credit when buyer_amount > 0 else final, and is
+idempotent; adding or moving a line onto a finished load is 409 load_finished
+while lines already on it are untouched; PUT account takes a non-zero signed
+amount and DELETE clears it; DELETE on a non-draft sale is 409 not_deletable and
+a draft cascades to invoice, lines, porterage and payments.
+
+Endpoints (all mounted under /sales/): list+create, detail+delete, lines create,
+lines patch/delete, porterage PUT, payments create, payments patch/delete,
+account PUT/DELETE, finalize POST, porterage-settings GET/PATCH. Every create,
+update and nested delete returns the FULL sale detail; creates 201, rest 200.
+
+SaleCursorPagination: page size 30, ordering ("-created_at","-id"), applied via
+pagination_class on the view only - no global DEFAULT_PAGINATION_CLASS change.
+
+--------------------------------------------------------------------------------
+Step 8  897c70d  admin, seed_demo
+--------------------------------------------------------------------------------
+Admin: Party, Bank, Sale (invoice + payments inlined, computed fields
+read-only), Invoice (with the lines inline), Porterage, PorterageSettings with
+no add and no delete. Django has no nested inlines, so the lines sit on the
+Invoice that owns them - this is the one place the admin shape departs from a
+literal reading of the spec, and it is noted rather than hacked around.
+
+seed_demo (still safe to run twice, verified): sets sticker/background on the demo
+products (cucumber #2E7D32, tomato #C62828, banana #F9A825), creates 3 banks,
+5 parties with labels (one carrying national_code 0499370899), and the default
+PorterageSettings row.
+
+--------------------------------------------------------------------------------
+Step 9  f3b02a0  full test suite
+--------------------------------------------------------------------------------
+196 tests total: catalog 21, inventory 45, parties 41, accounting 6, sales 83.
+All 35 session-1 tests still pass unmodified.
+
+--------------------------------------------------------------------------------
+Step 10 ff945fb  URL mount fix + README
+--------------------------------------------------------------------------------
+See "Defects found by testing" item 2 below: porterage-settings was mounted at
+/porterage-settings/ instead of /sales/porterage-settings/. Fixed and pinned by
+a test that asserts the literal path. README updated with the full endpoint
+tables, the 409 code table and app-facing notes.
+
+
+================================================================================
+3. MIGRATIONS
+================================================================================
+
+  catalog/0002_product_background_product_sticker
+      + Add field background to product
+      + Add field sticker to product
+
+  parties/0001_initial
+      + Create model Party   (both UniqueConstraints and the 2 indexes)
+
+  accounting/0001_initial
+      + Create model Bank
+
+  inventory/0002_alter_load_supplier_load_tare_weight_delete_supplier
+      ~ Alter field supplier on load  ->  parties.Party
+      + Add field tare_weight to load
+      - Delete model Supplier                  <<< SUPPLIER REMOVAL
+      dependencies: [('inventory','0001_initial'), ('parties','0001_initial')]
+
+  inventory/0003_backfill_load_tare_weight     <<< TARE BACKFILL
+      RunPython copy_product_tare_to_loads: for each product, update the loads
+      that still sit on the 0 default to that product's tare_weight. "Only fill
+      in the zero default; never overwrite a real value." The reverse is a
+      deliberate no-op - the original per-load values cannot be reconstructed.
+
+  sales/0001_initial
+      + PorterageSettings, Invoice, InvoiceLine, Sale, Porterage, Payment
+      + indexes sale_status_created_idx (status,-created_at,-id)
+                 sale_created_idx (-created_at,-id)
+
+Migration safety for the Supplier removal: the AlterField declares an explicit
+dependency on parties.0001_initial, so Django cannot reorder it, and every dev
+row has supplier_id NULL, so nothing needs a data fixup.
+
+
+================================================================================
+4. DEFECTS FOUND BY TESTING (and fixed)
+================================================================================
+
+These are worth recording because each one passed a plausible first reading and
+was only caught by executing the code.
+
+1. normalize_digits mapped to the WRONG CODEPOINT.
+   The translation table was built as {code: code - 0x06F0}, which maps U+06F0 to
+   0 (NUL), not to ord('0') = 48. Every Persian digit became a control character,
+   so every Persian national code failed validation. Fixed by mapping onto
+   _ASCII_ZERO + offset.
+
+2. The national-code checksum was off by one.
+   It used (NATIONAL_CODE_LENGTH - 1 - i) = 9 - i. The spec formula is 10 - i.
+   This rejected BOTH documented valid examples (0499370899 and 0012345679).
+   Caught by the first party smoke test.
+
+3. The sales URL prefix was DOUBLED.
+   config/urls.py included sales.urls under 'sales/' while sales/urls.py already
+   declared 'sales/<int:pk>/', so the real path was /sales/sales/1/. The test
+   suite did NOT catch this: reverse() produced /sales/sales/1/ and the client
+   happily requested it, so every test passed against a URL no human would ever
+   use. Only a real HTTP request exposed it.
+
+4. porterage-settings was mounted at the WRONG PATH.
+   Same class of bug: /porterage-settings/ instead of the specified
+   /sales/porterage-settings/. reverse() again hid it. Now asserted directly.
+
+5. "lines" VANISHED from the sale detail payload.
+   InvoiceLine hangs off Invoice (related_name="lines"), not off Sale, so DRF
+   could not resolve Sale.lines. Because the field was read_only, DRF's
+   get_attribute raised SkipField and the key was silently OMITTED - a 200
+   response with a missing key, which no shape assertion had been strict enough
+   to catch. Fixed with source='invoice.lines'.
+
+6. validate_gross_weight was never bound as a method.
+   Assigning a plain function in a Serializer class body produced
+   TypeError: positive_gross_weight() takes 1 positional argument but 2 were
+   given.
+
+7. "_" used as both the gettext alias and a throwaway variable.
+   In _reject_empty_net the line `net_weight, _ = line_amounts(...)` shadowed the
+   gettext alias for the rest of the function, so the very next line called an
+   int. Renamed to line_total.
+
+Defects 3, 4 and 5 share one lesson worth keeping: reverse() round-trips
+perfectly well against a wrong URL pattern, and a read_only field that fails to
+resolve disappears rather than erroring. Both are invisible to a suite that only
+asserts "the call I made returned 200".
+
+Also fixed, not a defect but a hardening: a plain DRF Serializer silently ignores
+unknown keys, so LoadPatchSerializer.to_internal_value now refuses fields outside
+{label, tare_weight, product} instead of quietly dropping them.
+
+
+================================================================================
+5. ASSUMPTIONS MADE
+================================================================================
+
+1. STEP ORDER WAS REORDERED (agreed before coding). The spec's step 3 makes
+   Load.supplier a FK to parties.Party and its migration depends on the parties
+   app, which the spec does not create until step 4. parties and accounting were
+   therefore built BEFORE the inventory changes. Same work, one commit per step.
+
+2. LEGACY LOAD FIELDS KEPT (agreed before coding). receipt, status, weight, rate,
+   quantity and arrived_at are untouched. The spec only deletes Supplier.
+
+3. PorterageSettings is a pk=1 singleton, created lazily by
+   get_porterage_settings() on first read (seed_demo also creates it). save()
+   forces pk=1; delete() raises ValueError; the admin exposes no add and no
+   delete.
+
+4. A non-positive net weight is reported under the field key "net_weight". The
+   spec says only "a field error on the weight"; net_weight is the derived field
+   that actually failed, and the spec requires the key to exist so the app can
+   highlight it.
+
+5. Party (name,label) duplicates surface DRF's own UniqueTogetherValidator
+   message under non_field_errors; national_code gets an explicit serializer
+   check because DRF SKIPS conditional constraints when building validators.
+   Both are ordinary 400 field errors. The database stays authoritative: the view
+   still catches IntegrityError and returns a 400 for the losing racer.
+
+6. PUT /sales/{id}/porterage/ stores the amount verbatim even when
+   works_with_porters is False. "Never change the amount" governs the
+   incremental delta; PUT is an explicit manual override that later deltas build
+   on, so it is applied regardless.
+
+7. POST /sales/ takes an empty body; the sale has nothing to ask for.
+
+8. sale list items carry products as {id, sticker, background} exactly as
+   written - no name field.
+
+9. No "step" or multiple-of validation on any amount, and no constraints beyond
+   the sign rules the spec states.
+
+10. Account and invoice admin fields are read-only in the admin, matching the
+    spec's "managed only through the account endpoint".
+
+11. The one structural deviation: invoice lines are edited on the Invoice admin
+    page rather than inline on Sale, because Django does not support nested
+    inlines. Chosen over a fragile get_inline_instances workaround.
+
+
+================================================================================
+6. TEST RESULTS
+================================================================================
+
+  python manage.py test          ->  Ran 196 tests    OK
+  python manage.py check        ->  no issues
+  python manage.py makemigrations --check --dry-run  ->  No changes detected
+  python manage.py seed_demo    ->  run twice, second run created nothing
+
+  Per app:  catalog 21 | inventory 45 | parties 41 | accounting 6 | sales 83
+  Session-1 tests: 35/35 still passing, unmodified.
+
+Coverage of the spec's section 11 checklist:
+
+  Product        sticker/background validation and normalization; list returns both
+  Load           tare copied on create; PATCH product-immutable / duplicate label /
+                 blank-with-sibling / tare change; DELETE 204 and 409 in_use when a
+                 line references it; finish and restore unaffected
+  Party          normalization; unique (name,label) after normalization; checksum
+                 valid/invalid/all-same/wrong-length/Persian-digits; unique
+                 national code with several NULLs allowed; commission range;
+                 details validation; search over name and label; no DELETE
+  Sales lines    103.500 gross, tare 1.000 x qty 5, rate 450000 -> net 98.500 and
+                 line_total 44325000; net <= 0 -> 400; finished load -> 409; same
+                 load twice allowed; PATCH recalculates; DELETE returns full sale
+  Porterage      add adds the delta; 400000 + 66000 = 450000 with rounding on;
+                 unrounded with rounding off; delete subtracts and floors at 0;
+                 edit applies only the weight difference; works_with_porters False
+                 leaves 0; manual PUT then a new line builds on it; round_porterage
+                 examples including the 20000 -> 50000 minimum step
+  Settlement     summary math incl. cash 1500 + account -500 on a total of 1000
+                 giving remaining 0; bank rules per method; account PUT and DELETE;
+                 finalize gives final or credit by the sign of buyer_amount;
+                 409 no_lines; 409 not_settled carrying remaining; finalize twice
+                 is idempotent
+  Reopen         every mutation of a finalized sale flips it to draft; GET does not
+  Deletion       draft cascades; non-draft gives 409 not_deletable
+  Sales list     -created_at then -id ordering; status and party filters; invalid
+                 status 400; stickers distinct and in line order; CONSTANT QUERY
+                 COUNT for 1 and 25 sales; cursor pagination repeats and skips
+                 nothing when a sale is created between two page requests
+  PorterageSettings  singleton; GET and PATCH; rate_per_kg >= 0
+
+The constant-query claim was measured, not assumed: 2 queries for a page of 1 sale
+and 2 queries for a page of 25 - one SELECT joining Sale->Invoice->Buyer and one
+prefetch of lines->load->product.
+
+A live-server pass was also run over real HTTP for every endpoint, which is how
+defects 3 and 4 surfaced. The two mismatches it reported at the end were the
+script's own arithmetic, not API faults: a second line was still present so
+409 not_settled was correct, and the sale was therefore still a draft so 204 was
+correct.
+
+
+================================================================================
+7. LEFTOVERS AND KNOWN LIMITS
+================================================================================
+
+1. DRF's default invalid-PK message leaks English scaffolding into Persian
+   responses: {"load": ["pk نامعتبر \"29\" - این Object وجود ندارد"]}. It is
+   Persian but reads badly. Fixable with a small shared PrimaryKeyRelatedField
+   subclass overriding default_error_messages. Not done because the spec did not
+   ask for it.
+
+2. select_for_update is a NO-OP ON SQLITE. Django reports
+   has_select_for_update = False, so the FOR UPDATE clause is simply omitted and
+   the row lock does not actually happen in development. The code is correct and
+   will lock on PostgreSQL; it is untested for real until then. This matters for
+   porterage deltas specifically.
+
+3. Bank accounts are a placeholder, as specified.
+
+4. created_by on Sale is nullable and unused until authentication arrives.
+
+5. The dev SQLite database accumulated junk rows from this session's manual
+   smoke scripts (duplicate products and parties). Those specific rows - created
+   by the testing, referenced by no sale - were removed; the database is
+   gitignored and 12 products / 3 banks / 5 parties from seed_demo remain.
+
+
+================================================================================
+8. COMMITS
+================================================================================
+
+  ff945fb  Step 10: mount porterage settings under /sales/, document endpoints
+  f3b02a0  Step 9: full sales test suite
+  897c70d  Step 8: admin, seed_demo with stickers, banks, parties, settings
+  6d5e5ad  Step 7: sales service layer and all sales endpoints
+  edd70b7  Step 6: sales models and migrations
+  f7feb56  Step 5: accounting app with a read-only Bank list
+  22f1aec  Step 4: Load tare_weight, Party FK, PATCH and DELETE endpoints
+  c3ef2f8  Step 3: catalog Product gains sticker key and hex background
+  a1012d8  Step 2: parties app
+  5ebb5e3  Step 1: shared config.text module and normalize_digits
+
+  54 files changed, 3935 insertions(+), 155 deletions(-)
+  One commit per spec step, working tree clean.
+
+
+================================================================================
+9. CURL REFERENCE
+================================================================================
+
+  BASE=http://127.0.0.1:8000
+
+  # ---- catalog / inventory -------------------------------------------------
+  GET    $BASE/catalog/products/
+  POST   $BASE/inventory/loads/            {"product":1,"label":"الف"}
+  PATCH  $BASE/inventory/loads/1/          {"label":"  ب   الف ","tare_weight":"1.000"}
+  PATCH  $BASE/inventory/loads/1/          {"product":2}          -> 400
+  DELETE $BASE/inventory/loads/1/                                -> 204
+  DELETE $BASE/inventory/loads/1/          -> 409 in_use (on an invoice line)
+  POST   $BASE/inventory/loads/1/finish/
+  POST   $BASE/inventory/loads/1/restore/
+
+  # ---- parties / accounting ------------------------------------------------
+  GET    $BASE/parties/?q=%D8%B1%D8%B6%D8%A7%DB%8C%DB%8C
+  POST   $BASE/parties/  {"name":"  رضايي  ","label":"همسایه",
+                           "phone":"۰۹۱۲۳۴۵۶۷۸۹","national_code":"۰۰۱۲۳۴۵۶۷۹"}
+  GET    $BASE/parties/1/
+  PATCH  $BASE/parties/1/                  {"commission":"12.5"}
+  DELETE $BASE/parties/1/                                        -> 405
+  GET    $BASE/accounting/banks/
+
+  Invalid national code:
+      {"national_code": ["کد ملی معتبر نیست."]}
+  Duplicate national code:
+      {"national_code": ["کد ملی قبلاً ثبت شده است."]}
+
+  # ---- porterage settings --------------------------------------------------
+  GET    $BASE/sales/porterage-settings/
+  PATCH  $BASE/sales/porterage-settings/   {"rate_per_kg":15000,"round_enabled":true}
+  PATCH  $BASE/sales/porterage-settings/   {"rate_per_kg":-1}    -> 400
+
+  # ---- sales lifecycle -----------------------------------------------------
+  POST   $BASE/sales/                                                   -> 201
+  GET    $BASE/sales/?status=draft&party=1&cursor=...
+  GET    $BASE/sales/1/
+  DELETE $BASE/sales/1/                                                 -> 204
+  DELETE $BASE/sales/1/    (non-draft)
+      {"code":"not_deletable","detail":"تنها فروش پیش‌نویس قابل حذف است."}
+
+  POST   $BASE/sales/1/lines/  {"load":12,"gross_weight":"103.500",
+                                "quantity":5,"rate":450000}           -> 201
+      -> "net_weight":"98.500", "line_total":44325000
+  POST   $BASE/sales/1/lines/  (net <= 0)                             -> 400
+  POST   $BASE/sales/1/lines/  (finished load)
+      {"code":"load_finished","detail":"این بار پایان یافته است و قابل فروش نیست."}
+  PATCH  $BASE/sales/1/lines/5/  {"gross_weight":"50.000"}
+  DELETE $BASE/sales/1/lines/5/                                       -> 200
+
+  PUT    $BASE/sales/1/porterage/  {"amount":400000}
+  POST   $BASE/sales/1/payments/  {"method":"pos","bank":1,"amount":1000}  -> 201
+  POST   $BASE/sales/1/payments/  {"method":"pos","amount":100}           -> 400
+  POST   $BASE/sales/1/payments/  {"method":"cash","bank":1,"amount":100} -> 400
+  PATCH  $BASE/sales/1/payments/3/  {"amount":2000}
+  DELETE $BASE/sales/1/payments/3/
+
+  PUT    $BASE/sales/1/account/  {"party":7,"amount":24725000}
+  DELETE $BASE/sales/1/account/
+
+  POST   $BASE/sales/1/finalize/   (no lines)
+      {"code":"no_lines","detail":"این فروش هیچ ردیفی ندارد."}
+  POST   $BASE/sales/1/finalize/   (remaining != 0)
+      {"code":"not_settled","detail":"مانده حساب این فروش صفر نیست.",
+       "remaining":123456}
+  POST   $BASE/sales/1/finalize/   (settled)                            -> 200
+
+  Full detail shape:
+  {"id":42,"status":"draft","total_amount":44725000,"created_at":"...",
+   "finalized_at":null,
+   "lines":[{"id":1,"load":12,"product":3,"product_name":"سیب","label":"درجه یک",
+             "quantity":5,"gross_weight":"103.500","net_weight":"98.500",
+             "rate":450000,"line_total":44325000}],
+   "porterage":{"amount":400000},
+   "payments":[{"id":3,"method":"pos","bank":1,"bank_name":"...","amount":20000000}],
+   "account":{"party":{"id":7,"name":"رضایی","label":"همسایه"},"amount":24725000},
+   "summary":{"total":44725000,"paid":20000000,"accounted":24725000,
+              "remaining":0}}
+
+  List item shape:
+  {"id":42,"status":"draft","total_amount":44725000,"created_at":"...",
+   "party":{"id":7,"name":"رضایی","label":"همسایه"},
+   "products":[{"id":3,"sticker":"apple","background":"#2E7D32"}]}
+
+
+================================================================================
+END OF REPORT
+================================================================================
