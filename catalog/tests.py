@@ -166,6 +166,46 @@ class ProductStickerTests(APITestCase):
         self.assertEqual(response.data[0]['sticker'], 'cucumber')
 
 
+class ProductNameUniquenessTests(APITestCase):
+    """Clients group loads by product name, so a name identifies one product."""
+
+    def setUp(self):
+        self.product = Product.objects.create(name='خیار')
+
+    def test_a_second_product_with_the_same_name_is_rejected(self):
+        with self.assertRaises(ValidationError):
+            Product(name='خیار').full_clean()
+
+    def test_the_name_is_normalized_before_the_check(self):
+        Product.objects.create(name='  گوجه  ')
+        with self.assertRaises(ValidationError):
+            Product(name='گوجه').full_clean()
+        self.assertEqual(Product.objects.get(name='گوجه').pk, self.product.pk + 1)
+
+    def test_different_names_are_allowed(self):
+        Product.objects.create(name='گوجه')
+        self.assertEqual(Product.objects.count(), 2)
+
+    def test_resaving_a_product_with_its_own_name_is_allowed(self):
+        self.product.sticker = 'cucumber'
+        self.product.full_clean()
+        self.product.save()
+        self.assertEqual(Product.objects.count(), 1)
+
+    def test_the_database_rejects_a_duplicate_name(self):
+        from django.db import IntegrityError, transaction
+
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                Product.objects.create(name='خیار')
+
+    def test_renaming_a_product_onto_another_name_is_rejected(self):
+        other = Product.objects.create(name='گوجه')
+        with self.assertRaises(ValidationError):
+            other.name = 'خیار'
+            other.full_clean()
+
+
 class ProductBackgroundTests(APITestCase):
     def setUp(self):
         self.url = reverse('product-list')

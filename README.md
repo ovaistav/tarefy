@@ -54,7 +54,7 @@ python manage.py runserver 0.0.0.0:8000
 | Method | Path | Purpose |
 | --- | --- | --- |
 | GET | `/catalog/products/` | Product list, no pagination |
-| GET | `/inventory/loads/?available=true` | Load list; `available=true` hides finished loads |
+| GET | `/inventory/loads/?available=true` | Loads grouped by product name; `available=true` hides finished loads |
 | POST | `/inventory/loads/` | Create a load (201) |
 | PATCH | `/inventory/loads/{id}/` | Change `label` and `tare_weight` only |
 | DELETE | `/inventory/loads/{id}/` | Delete a load (204), or 409 `in_use` |
@@ -69,6 +69,7 @@ python manage.py runserver 0.0.0.0:8000
 | POST | `/parties/` | Create a party (201) |
 | GET | `/parties/{id}/` | Full party |
 | PATCH | `/parties/{id}/` | Update a party |
+| DELETE | `/parties/{id}/` | Delete a party (204), or 409 `in_use` if anything references it |
 | GET | `/accounting/banks/` | `[{id, name}]` by name; read only |
 
 ### Sales
@@ -137,6 +138,8 @@ curl -s $BASE/catalog/products/
 `image_updated_at` (not `updated_at`) because the app uses it as an image cache key,
 so it only changes when the image itself changes.
 
+`name` is unique: loads are grouped by it, so one name can only mean one product.
+
 ### List loads
 
 ```bash
@@ -148,11 +151,24 @@ curl -s "$BASE/inventory/loads/"
 ```
 
 ```json
-[
-  { "id": 1, "product": 1, "product_name": "خیار", "label": "الف", "tare_weight": "0.000" },
-  { "id": 2, "product": 1, "product_name": "خیار", "label": "ب", "tare_weight": "0.000" }
-]
+{
+  "خیار": {
+    "product": 1,
+    "sticker": "cucumber",
+    "background": "#2E7D32",
+    "loads": [
+      { "id": 1, "product": 1, "product_name": "خیار", "label": "الف", "tare_weight": "0.000" },
+      { "id": 2, "product": 1, "product_name": "خیار", "label": "ب", "tare_weight": "0.000" }
+    ]
+  }
+}
 ```
+
+The list is grouped by product name so the app can draw one tile per product with
+the loads it still offers. `sticker` and `background` belong to the product and are
+repeated in every group, so a tile never needs a second request. A product with no
+matching load has no key at all. Product names are unique, so a key always points
+at exactly one product.
 
 ### Update a load
 
@@ -325,14 +341,29 @@ curl -s -X POST $BASE/inventory/loads/1/restore/
 ### Parties
 
 - `name` and `label` together are unique, and both are normalized before saving, so
-  `"رضايي"` and `"رضایی"` can never become two parties.
+  `"رضايي"` and `"رضایی"` can never become two parties. `label` keeps its API name —
+  what the app shows the user, and what the errors say, is **«توصیف»**. A blank one
+  gives `{"label": ["توصیف الزامی است."]}`; a duplicate pair gives
+  `{"non_field_errors": ["طرف حسابی با همین نام و توصیف قبلاً ثبت شده است."]}`.
+- There is no `description` field (migration `parties.0003`); free-form notes go in
+  `details`. Sending `description` is silently ignored.
 - `national_code` is stored as `NULL` (never `""`) when absent, which is why many
   parties may lack one. When present it is validated with the official Iranian
   checksum.
+- `account_number` (nullable, max 20) is normalized exactly like `phone`: Persian
+  digits become ASCII and spaces are dropped. It is deliberately **not** unique and
+  carries no checksum — one account may serve several parties, and the server does
+  not know which banks exist. Note that both optional number columns store `""`
+  rather than `NULL` for a value that was never filled in, so treat `null` and `""`
+  alike.
 - `details` is a free-form map of short strings to short strings (max 50 keys, key
   length 50, value length 500). The server never interprets the keys — bank account
   number, origin and friends live in the app.
-- There is no `DELETE`: parties are never removed.
+- `DELETE /parties/{id}/` returns 204 when nothing references the party, and 409
+  `in_use` when something does. Both `sales.Invoice.buyer` (PROTECT) and
+  `inventory.Load.supplier` (SET_NULL) count as references — the check walks the
+  reverse relations, so a FK added to Party later is covered automatically. There is
+  no soft delete.
 
 ### Sales
 

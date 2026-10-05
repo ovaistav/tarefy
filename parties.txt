@@ -1,0 +1,356 @@
+Parties -- every endpoint and every rule
+======================================
+
+A Party is any counterparty of the vegetable seller: a customer, a supplier, a
+neighbour who buys on credit. There is one table for all of them.
+
+Set this first:
+
+    BASE=http://127.0.0.1:8000
+
+
+Endpoints
+---------
+
+    GET    /parties/          list, optionally filtered by ?q=
+    POST   /parties/          create
+    GET    /parties/{id}/     full party
+    PATCH  /parties/{id}/     update
+    DELETE /parties/{id}/     delete, but only when nothing references the party
+
+DELETE returns 204 with no body when nothing references the party, and 409
+{"code": "in_use", ...} when something does. A party that appears in your
+accounting history cannot be removed. See section 5.
+
+The list is NOT paginated. The app needs every party to hand, because it shows
+them in a picker.
+
+
+1. GET /parties/ -- list
+------------------------
+
+   curl -s $BASE/parties/
+
+   curl -s "$BASE/parties/?q=رضا"
+
+   -> 200
+
+The item shape is deliberately tiny, three fields:
+
+   [
+     { "id": 1, "name": "رضایی", "label": "همسایه" },
+     { "id": 2, "name": "کریمی", "label": "دکان" }
+   ]
+
+Results are ordered by name, then label.
+
+Searching with ?q=
+------------------
+
+?q= matches the name **or** the label, case-insensitively, as a substring.
+It matches either field, not both:
+
+   ?q=رضا    -> matches name "رضایی"
+   ?q=دکان   -> matches label "دکان" of party "کریمی"
+
+?q= is normalized exactly like stored values before matching, so Arabic
+look-alikes and stray whitespace collapse:
+
+   ?q=%20رضايي%20   -> same result as ?q=رضایی
+
+An empty or absent ?q= returns everything. A ?q= that matches nothing returns [],
+not 404.
+
+
+2. POST /parties/ -- create
+---------------------------
+
+   curl -s -X POST $BASE/parties/ \
+     -H 'Content-Type: application/json' \
+     -d '{"name":"رضایی","label":"همسایه","phone":"۰۹۱۲ ۳۴۵ ۶۷۸۹"}'
+
+   -> 201 with the full party
+
+Only name and label are required. Everything else has a default:
+
+   {
+     "id": 1,
+     "name": "رضایی",
+     "label": "همسایه",
+     "phone": "09123456789",
+     "account_number": "0987654321",
+     "national_code": null,
+     "commission": "10.00",
+     "details": {},
+     "created_at": "2026-10-05T13:51:22.104881+03:30",
+     "updated_at": "2026-10-05T13:51:22.104912+03:30"
+   }
+
+A fuller example:
+
+   curl -s -X POST $BASE/parties/ \
+     -H 'Content-Type: application/json' \
+     -d '{
+           "name": "  رضايي   شریک ",
+           "label": "  همسایه ",
+           "phone": "۰۹۱۲۳۴۵۶۷۸۹",
+           "account_number": "۰۹۸۷ ۶۵۴ ۳۲۱",
+           "national_code": "۰۴۹۹۳۷۰۸۹۹",
+           "commission": "12.5",
+           "details": {"توضیح": "خرید هفتگی", "مبدأ": "اصفهان"}
+         }'
+
+   -> 201, and everything comes back normalized:
+      name "رضایی شریک", phone "09123456789",
+      account_number "0987654321", national_code "0499370899",
+      commission "12.50"
+
+
+3. GET /parties/{id}/ -- full party
+-----------------------------------
+
+   curl -s $BASE/parties/1/
+
+   -> 200, the full object as shown above
+
+   curl -s $BASE/parties/999999/    -> 404
+       {"detail": "موردی با این مشخصات یافت نشد."}
+
+Note the difference from the list endpoint: the list returns only
+{id, name, label}, the detail endpoint returns every field.
+
+
+4. PATCH /parties/{id}/ -- update
+----------------------------------
+
+   curl -s -X PATCH $BASE/parties/1/ \
+     -H 'Content-Type: application/json' \
+     -d '{"commission":"7.5"}'
+
+   -> 200 with the full party, commission now "7.50"
+
+   curl -s -X PATCH $BASE/parties/1/ \
+     -H 'Content-Type: application/json' \
+      -d '{"phone":"09121111111","details":{"توضیح":"مشتری وفادار"}}'
+
+   -> 200, name and label untouched
+
+Updates are always partial: send only what changes, never the whole object.
+PUT is accepted too and behaves identically, because the app only ever sends the
+fields it wants to change.
+
+   curl -s -X PATCH $BASE/parties/999999/ -d '{}'   -> 404
+
+
+The fields
+----------
+
+  name          required    string, max 100. Normalized, may not be blank.
+  label         required    string, max 100. Shown as "توصیف". Normalized, may
+                            not be blank. Short nickname, not a paragraph.
+  phone         optional    string, max 20. Not format-checked.
+  account_number optional   string, max 20. Bank account number. Optional and
+                            never unique. Not format-checked.
+  national_code optional    exactly 10 digits with a valid Iranian checksum,
+                            or null. Normalized to ASCII digits.
+  commission    optional    0 to 100, two decimals. A percentage, not money.
+                            Defaults to 10.
+  details       optional    object of short strings to short strings. Free-form
+                            notes live here.
+  id / created_at / updated_at             read only
+
+
+The name "توصیف", and the missing description field
+--------------------------------------------------
+
+`label` keeps its API name; renaming it would break every existing client. What
+the app shows the user, and what the error messages say, is "توصیف".
+
+There is no `description` field. It was dropped because it duplicated `details`,
+and having one field the user calls توصیف and another called description was
+confusing. Notes go in `details` under whatever keys the app likes.
+
+Migration 0003 removes the column. Sending `description` to the API is silently
+ignored -- the request succeeds and the value is not stored.
+
+
+Normalization
+-------------
+
+Everything is normalized on the way in, so the database constraints compare the
+canonical form and a typo cannot create a second copy of the same party.
+
+  name, label        trimmed, internal whitespace runs collapsed to one space,
+                     and the Arabic look-alikes ي -> ی and ك -> ک
+  phone              Persian and Arabic-Indic digits mapped to ASCII 0-9, all
+                     spaces removed
+                     "۰۹۱۲ ۳۴۵ ۶۷۸۹" is stored as "09123456789"
+  account_number     the same treatment as phone
+                     "۰۹۸۷ ۶۵۴ ۳۲۱" is stored as "0987654321"
+  national_code      digits mapped to ASCII, trimmed; an empty value is stored
+                     as NULL, never as ""
+
+So "رضايي" and "رضایی" are the same party. Creating both returns 400 on the
+second one, not a duplicate row.
+
+A caveat on phone and account_number: both columns are nullable, but
+normalization runs on save and turns a missing value into "", so the API stores
+"" rather than NULL for "not filled in". Parties that predate the
+account_number column keep a real null. Treat both null and "" as "no value".
+
+
+Uniqueness
+----------
+
+Two rules, both enforced by the database, both reported to you as a plain 400
+field error -- *not* as a 409. They are ordinary validation rules, not a
+conflict about server state.
+
+  1. (name, label) is unique as a pair.
+     The same name may appear many times as long as the توصیف values differ:
+         "رضایی / همسایه"     ok
+         "رضایی / دکان"       ok
+         "رضایی / همسایه"     400, already exists
+
+     Response, reported under non_field_errors because the complaint is about the
+     two fields together:
+         {"non_field_errors": ["طرف حسابی با همین نام و توصیف قبلاً ثبت شده است."]}
+
+  2. national_code is unique among parties that have one.
+     Many parties may have no code at all; that is why absent codes are NULL
+     rather than "".
+
+     Response:
+         {"national_code": ["کد ملی قبلاً ثبت شده است."]}
+
+A racing write that slips past the checks still cannot corrupt anything: the
+database rejects it and the server turns that into the same 400.
+
+
+5. DELETE /parties/{id}/ -- delete a party
+-------------------------------------------
+
+   curl -s -X DELETE $BASE/parties/9/
+
+   -> 204, empty body, the row is gone
+
+   curl -s -X DELETE $BASE/parties/999999/
+   -> 404
+
+A party may be deleted only when nothing points at it. Two relations count:
+
+  sales.Invoice.buyer      on_delete=PROTECT. A party that has been invoiced is
+                           part of the accounting history; deleting it would
+                           rewrite the meaning of a recorded sale.
+
+  inventory.Load.supplier  on_delete=SET_NULL. The database would let the delete
+                           through and quietly strip the supplier from every load
+                           it was attached to, which is still a reference.
+
+Either one blocks the delete:
+
+   {"code": "in_use",
+    "detail": "این طرف حساب در فروش‌ها یا بارها استفاده شده است و قابل حذف نیست."}
+
+referencing_relations() in parties/views.py walks party._meta.related_objects
+instead of naming the relations, so a foreign key added to Party later is
+covered without changing anything here. There is no soft delete or archive flag.
+
+
+Validation reference
+--------------------
+
+  Missing name                     400  {"name": ["نام الزامی است."]}
+  Blank name after normalization   400  {"name": ["نام الزامی است."]}
+  Missing label                    400  {"label": ["این مقدار لازم است."]}
+  Blank label                      400  {"label": ["توصیف الزامی است."]}
+  Duplicate name+label             400  {"non_field_errors": [...]}
+  Duplicate national_code          400  {"national_code": [...]}
+
+  national_code not 10 digits      400  {"national_code": ["کد ملی باید دقیقاً ۱۰ رقم باشد."]}
+  national_code all same digits    400  {"national_code": ["کد ملی معتبر نیست."]}
+  national_code bad checksum       400  {"national_code": ["کد ملی معتبر نیست."]}
+  national_code with a letter      400  {"national_code": ["کد ملی باید دقیقاً ۱۰ رقم باشد."]}
+  national_code "" or null         accepted, stored as NULL
+
+  commission below 0 or above 100   400  {"commission": ["Ensure this value is ..."]}
+  commission 0, 12.5, 100          accepted
+
+  account_number over 20 chars     400  {"account_number": [...]}
+  account_number over 20 on PATCH  400  {"account_number": [...]}
+  account_number not a real
+  account number                   accepted, no such validation exists
+  the same account_number
+  on two parties                   accepted, it is not unique
+
+  details not an object            400  {"details": ["جزئیات باید یک شیء باشد."]}
+  details value not a string       400  {"details": ["مقدار جزئیات باید متن باشد."]}
+  details key longer than 50       400  {"details": ["کلید جزئیات حداکثر ۵۰ نویسه باشد."]}
+  details value longer than 500    400  {"details": ["مقدار جزئیات حداکثر ۵۰۰ نویسه باشد."]}
+  details with more than 50 keys   400  {"details": ["جزئیات حداکثر ۵۰ مورد می‌تواند داشته باشد."]}
+  details 50 keys                  accepted
+
+  Any status 400 looks like:
+      { "<field>": ["<Persian message>"] }
+
+  Unknown id                       404  {"detail": "موردی با این مشخصات یافت نشد."}
+  DELETE on a referenced party     409  {"code": "in_use", ...}
+  DELETE on an unreferenced party  204  empty body
+
+
+About details
+-------------
+
+details is a free-form map of short strings to short strings. The server never
+interprets the keys -- "شماره حساب", "مبدأ" and friends are suggestions that live
+in the mobile app. Limits: at most 50 keys, keys up to 50 characters, values up
+to 500 characters, both sides strings.
+
+    { "شماره حساب": "1234", "مبدأ": "اصفهان" }
+
+
+Where a party is used
+---------------------
+
+  sales.Invoice.buyer    the customer of an invoice. on_delete=PROTECT: a party
+                         that has been invoiced can never be deleted, which is
+                         why the DELETE endpoint does not exist.
+  inventory.Load.supplier  nullable FK, on_delete=SET_NULL: deleting a party
+                         would leave the loads, just without a supplier. Reached
+                         only from the admin, the API has no field for it yet.
+
+Sales responses embed the party as
+{"id": 1, "name": "رضایی", "label": "همسایه"}, the same shape the list uses.
+
+
+A note on the national code
+--------------------------
+
+validate_national_code checks three things: the value is exactly ten digits, the
+digits are not all identical, and the official Iranian checksum matches.
+
+    total  = sum(digit * (10 - i)) for the first nine digits
+    result = total mod 11
+    valid  = digit[9] == result            when result < 2
+             digit[9] == 11 - result      otherwise
+
+Real codes to try: 0499370899, 0012345679. Persian digits are accepted and stored
+as ASCII: "۰۴۹۹۳۷۰۸۹۹" becomes "0499370899".
+
+These same validators run in the Django admin, so the API and the admin reject
+identical input with identical Persian messages.
+
+
+A note on account_number
+------------------------
+
+There is no validator for it. Unlike national_code it carries no checksum and no
+uniqueness rule, on purpose:
+
+* The server does not know which banks exist, so it cannot tell a valid account
+  from a typo.
+* One account legitimately belongs to several parties -- a shop, a family.
+* 20 characters is the cap, chosen to fit a local account number. A full 26
+  character IBAN will not fit; say so if you need those.
+
+The admin lists it and searches on it, next to phone.

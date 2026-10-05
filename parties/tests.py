@@ -2,6 +2,8 @@ from django.test import TestCase
 from django.urls import reverse
 from rest_framework.test import APITestCase
 
+from catalog.models import Product
+
 from .models import Party
 
 
@@ -20,7 +22,7 @@ class PartyListItemSerializerTests(APITestCase):
 
     def test_list_is_not_paginated(self):
         for index in range(40):
-            Party.objects.create(name=f'نام{index}', label='برچسب')
+            Party.objects.create(name=f'نام{index}', label='توصیف')
         response = self.client.get(self.url)
         self.assertEqual(len(response.data), 42)
 
@@ -57,14 +59,65 @@ class PartyCreationTests(APITestCase):
             'name',
             'label',
             'phone',
+            'account_number',
             'national_code',
             'commission',
-            'description',
             'details',
             'created_at',
             'updated_at',
         ]:
             self.assertIn(field, response.data)
+
+    def test_description_is_not_a_field_anymore(self):
+        # Free-form notes live in details; the field is gone from the payload.
+        response = self.post(name='a', label='b', description='hello')
+        self.assertNotIn('description', response.data)
+        self.assertFalse(hasattr(Party, 'description'))
+
+    def test_account_number_defaults_to_empty(self):
+        # phone has always behaved this way: a value that was never filled in is
+        # stored as "", not NULL, because normalize_digits(None) is "".
+        response = self.post(name='a', label='b')
+        self.assertEqual(response.data['account_number'], '')
+        self.assertEqual(
+            Party.objects.get(pk=response.data['id']).account_number, ''
+        )
+
+    def test_explicit_null_account_number_is_also_empty(self):
+        response = self.post(name='a', label='b', account_number=None)
+        self.assertEqual(response.data['account_number'], '')
+
+    def test_account_number_digits_are_normalized_and_spaces_removed(self):
+        response = self.post(name='a', label='b', account_number='۰۱۲ ۳۴۵ ۶۷۸۹')
+        self.assertEqual(response.data['account_number'], '0123456789')
+
+    def test_account_number_is_stored(self):
+        response = self.post(name='a', label='b', account_number='0123456789')
+        self.assertEqual(
+            Party.objects.get(pk=response.data['id']).account_number, '0123456789'
+        )
+
+    def test_account_number_is_optional_on_patch(self):
+        party = Party.objects.create(name='a', label='b')
+        response = self.client.patch(
+            reverse('party-detail', args=[party.id]),
+            {'account_number': '9876543210'},
+            format='json',
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['account_number'], '9876543210')
+
+    def test_too_long_account_number_is_rejected(self):
+        response = self.post(name='a', label='b', account_number='1' * 21)
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('account_number', response.data)
+
+    def test_account_numbers_may_repeat(self):
+        # Unlike national_code, an account is not unique: one account may serve
+        # several parties.
+        self.post(name='a', label='b', account_number='0123456789')
+        response = self.post(name='c', label='d', account_number='0123456789')
+        self.assertEqual(response.status_code, 201)
 
     def test_name_and_label_are_normalized(self):
         response = self.post(name='  رضايي   شریک  ', label='  هم   سایه ')
@@ -88,6 +141,29 @@ class PartyCreationTests(APITestCase):
         response = self.post(label='b')
         self.assertEqual(response.status_code, 400)
         self.assertIn('name', response.data)
+
+    def test_the_blank_label_message_calls_the_field_a_description(self):
+        response = self.post(name='a', label='   ')
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.data['label'], ['توصیف الزامی است.'])
+
+    def test_the_duplicate_pair_message_calls_the_field_a_description(self):
+        self.post(name='رضایی', label='همسایه')
+        response = self.post(name='رضایی', label='همسایه')
+        self.assertEqual(response.status_code, 400)
+        # non_field_errors, matching where the serializer's own
+        # UniqueTogetherValidator reports a duplicate pair.
+        self.assertEqual(
+            response.data['non_field_errors'],
+            ['طرف حسابی با همین نام و توصیف قبلاً ثبت شده است.'],
+        )
+
+    def test_a_patch_of_an_unrelated_field_does_not_hit_the_pair_rule(self):
+        party = Party.objects.create(name='رضایی', label='همسایه')
+        response = self.client.patch(
+            reverse('party-detail', args=[party.id]), {'commission': '5'}, format='json'
+        )
+        self.assertEqual(response.status_code, 200)
 
     def test_duplicate_name_and_label_is_rejected(self):
         self.post(name='رضایی', label='همسایه')
@@ -232,6 +308,7 @@ class PartyDetailsTests(APITestCase):
 class PartyUpdateTests(APITestCase):
     def setUp(self):
         self.party = Party.objects.create(name='رضایی', label='همسایه')
+        self.product = Product.objects.create(name='خیار')
         self.url = reverse('party-detail', args=[self.party.id])
 
     def test_get_returns_all_fields(self):
@@ -256,10 +333,42 @@ class PartyUpdateTests(APITestCase):
         )
         self.assertEqual(response.status_code, 400)
 
-    def test_there_is_no_delete_endpoint(self):
+    def test_a_referenced_party_cannot_be_deleted(self):
+        # An invoice points at the party with on_delete=PROTECT.
+        from sales.models import Invoice, Sale
+
+        Invoice.objects.create(buyer=self.party, sale=Sale.objects.create())
         response = self.client.delete(self.url)
-        self.assertEqual(response.status_code, 405)
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json()['code'], 'in_use')
+        self.assertIn('detail', response.json())
         self.assertTrue(Party.objects.filter(pk=self.party.pk).exists())
+
+    def test_a_party_used_as_a_load_supplier_cannot_be_deleted(self):
+        # Load.supplier is SET_NULL, so the database would allow the delete and
+        # quietly strip the supplier from the load. That is still a reference.
+        from inventory.models import Load
+
+        Load.objects.create(product=self.product, label='الف', supplier=self.party)
+        response = self.client.delete(self.url)
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json()['code'], 'in_use')
+        self.assertTrue(Party.objects.filter(pk=self.party.pk).exists())
+        self.assertEqual(
+            Load.objects.get(label='الف').supplier_id, self.party.pk
+        )
+
+    def test_an_unreferenced_party_can_be_deleted(self):
+        response = self.client.delete(self.url)
+        self.assertEqual(response.status_code, 204)
+        self.assertEqual(response.content, b'')
+        self.assertFalse(Party.objects.filter(pk=self.party.pk).exists())
+
+    def test_deleting_an_unknown_party_returns_404(self):
+        self.assertEqual(
+            self.client.delete(reverse('party-detail', args=[999999])).status_code,
+            404,
+        )
 
     def test_unknown_id_returns_404(self):
         self.assertEqual(

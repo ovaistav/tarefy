@@ -1,5 +1,8 @@
 from django.db import models
 from django.utils import timezone
+from django.utils.translation import gettext_lazy as _
+
+from config.text import normalize_text
 
 from .validators import (
     STICKER_MAX_LENGTH,
@@ -30,6 +33,15 @@ class Product(models.Model):
 
     class Meta:
         ordering = ['-updated_at', 'name']
+        constraints = [
+            # Clients group loads by product name, so the name identifies the
+            # product and may not be reused.
+            models.UniqueConstraint(
+                fields=['name'],
+                name='uniq_product_name',
+                violation_error_message=_('کالایی با این نام وجود دارد.'),
+            )
+        ]
 
     def __str__(self):
         return self.name
@@ -41,6 +53,7 @@ class Product(models.Model):
             not self.pk or self.image.name != self._loaded_image_name()
         ):
             self.image_updated_at = timezone.now()
+        self.name = normalize_text(self.name)
         self.background = normalize_background(self.background)
         super().save(*args, **kwargs)
 

@@ -46,6 +46,13 @@ class InUseConflict(ConflictAPIException):
     default_detail = 'این بار در یک فروش استفاده شده است و قابل حذف نیست.'
 
 
+class PartyInUseConflict(ConflictAPIException):
+    """A party is referenced by an invoice or a load, so it stays."""
+
+    default_code = 'in_use'
+    default_detail = 'این طرف حساب در فروش‌ها یا بارها استفاده شده است و قابل حذف نیست.'
+
+
 class LoadFinishedConflict(ConflictAPIException):
     default_code = 'load_finished'
     default_detail = 'این بار پایان یافته است و قابل فروش نیست.'

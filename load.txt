@@ -1,0 +1,184 @@
+Editing, finishing and deleting a load
+=====================================
+
+Set this first:
+
+    BASE=http://127.0.0.1:8000
+
+Four endpoints, all on the same resource:
+
+    PATCH  /inventory/loads/{id}/             edit label and tare_weight
+    POST   /inventory/loads/{id}/finish/      mark a load finished
+    POST   /inventory/loads/{id}/restore/     undo a finish
+    DELETE /inventory/loads/{id}/             delete a load
+
+Every one of them returns the same body shape on success:
+
+    {
+      "id": 7,
+      "product": 1,
+      "product_name": "خیار",
+      "label": "الف",
+      "tare_weight": "2.250"
+    }
+
+...except DELETE, which returns 204 with no body at all.
+
+
+1. Edit a load -- PATCH
+-----------------------
+
+    PATCH /inventory/loads/{id}/
+
+Only `label` and `tare_weight` may be changed. There is no PUT; it returns 405.
+
+Relabel:
+
+   curl -s -X PATCH $BASE/inventory/loads/7/ \
+     -H 'Content-Type: application/json' \
+     -d '{"label":"  ب   الف "}'
+
+   -> 200, and the label comes back normalized as "ب الف"
+
+
+Change the basket weight:
+
+   curl -s -X PATCH $BASE/inventory/loads/7/ \
+     -H 'Content-Type: application/json' \
+     -d '{"tare_weight":"2.250"}'
+
+   -> 200
+
+
+Both at once:
+
+   curl -s -X PATCH $BASE/inventory/loads/7/ \
+     -H 'Content-Type: application/json' \
+     -d '{"label":"الف","tare_weight":"2.250"}'
+
+   -> 200
+
+
+Outcomes
+
+  Unknown id                                 -> 404
+
+  {"product": 2}  (changing the product)     -> 400
+      {"product": ["کالای بار قابل تغییر نیست."]}
+
+  Any other field, e.g. weight, rate,
+  quantity, arrived_at, supplier             -> 400
+      {"<field>": ["این فیلد قابل تغییر نیست."]}
+
+  Label already used by another
+  available load of the same product          -> 400
+      {"label": ["برچسب بارهای یک کالا باید یکتا باشد."]}
+
+  Blank label while a sibling available
+  load exists                               -> 400
+      {"label": ["برچسب همه بارهای موجود باید وارد شود."]}
+
+  Negative tare_weight                       -> 400
+
+  Another client took the label first        -> 409 stale_state
+      Refetch the list and retry.
+
+  Reusing a *finished* load's label          -> 200
+
+
+Notes
+
+* Resending the load's *current* product id is accepted and ignored, so a whole
+  object can be round-tripped back without getting a 400.
+
+* The product is immutable on purpose. That is what keeps historical sales
+  pointing at the right goods.
+
+* label is normalized before saving: trimmed, whitespace runs collapsed, and the
+  Arabic look-alikes ي and ك folded to the Persian ی and ک.
+
+* tare_weight is the basket weight of *this* load, copied from the product when
+  the load was created. Editing the product's tare later does not rewrite loads
+  that already exist.
+
+
+2. Finish a load -- POST .../finish/
+------------------------------------
+
+    POST /inventory/loads/{id}/finish/
+
+   curl -s -X POST $BASE/inventory/loads/7/finish/
+
+   -> 200, body is the shape above.
+
+   curl -s -X POST $BASE/inventory/loads/7/finish/    # again: 200, nothing changes
+   curl -s -X POST $BASE/inventory/loads/9999/finish/  # 404
+
+Idempotent. The finished_at timestamp is written once and never moves, so reading
+it before and after the call tells you whether your call was the one that did the
+work.
+
+A finished load:
+
+* drops out of GET /inventory/loads/?available=true
+* frees its label for reuse by a new available load
+* can never be sold again -- adding it to a sale returns 409 load_finished
+
+
+3. Undo a finish -- POST .../restore/
+-------------------------------------
+
+    POST /inventory/loads/{id}/restore/
+
+   curl -s -X POST $BASE/inventory/loads/7/restore/
+
+   -> 200, body is the shape above.
+
+Also idempotent, 200.
+
+Fails with 409 restore_conflict if another available load of that product already
+holds the same label:
+
+    {"code": "restore_conflict",
+     "detail": "بار دیگری با همین برچسب موجود است."}
+
+The database would refuse the move, so this turns a crash into a message.
+
+
+4. Delete a load -- DELETE
+--------------------------
+
+    DELETE /inventory/loads/{id}/
+
+   curl -s -X DELETE $BASE/inventory/loads/7/     # 204, no body
+   curl -s -X DELETE $BASE/inventory/loads/9999/  # 404
+
+Outcomes
+
+  Deleted                          -> 204, empty body
+  Unknown id                       -> 404
+  Referenced by an invoice line    -> 409 in_use
+      {"code": "in_use",
+       "detail": "این بار در یک فروش استفاده شده است و قابل حذف نیست."}
+
+The 409 is the important one. A load that has been sold is history, and the API
+refuses to un-sell it: deleting it would silently rewrite the weight and totals of
+a recorded sale. Such a load can still be finished and relabeled, but not deleted.
+
+Note that DELETE does not check finished_at. A finished load with no sales can be
+deleted just like an available one. If the goal is only to take a load out of the
+picker, finish is the softer option and restore undoes it.
+
+
+Which one should I use?
+-----------------------
+
+  I mistyped a label                     -> PATCH
+  The basket weight was weighed wrong    -> PATCH
+  This load is done, take it off the
+  picker but keep the record             -> finish
+  That finish was a mistake              -> restore
+  This load should never have existed    -> DELETE
+
+
+There is no bulk variant of any of these and no hard delete.

@@ -5,6 +5,7 @@ from rest_framework import serializers, status
 from rest_framework.generics import ListCreateAPIView, RetrieveUpdateAPIView
 from rest_framework.response import Response
 
+from config.api import PartyInUseConflict
 from config.text import normalize_text
 
 from .models import Party
@@ -12,7 +13,10 @@ from .serializers import PartyListItemSerializer, PartySerializer
 
 DUPLICATE_MESSAGES = {
     'national_code': _('کد ملی قبلاً ثبت شده است.'),
-    'name': _('طرف حسابی با همین نام و برچسب قبلاً ثبت شده است.'),
+    # Reported under non_field_errors, not under "name", because that is where
+    # the serializer's own UniqueTogetherValidator puts the same complaint. One
+    # logical error must have one shape on the wire.
+    'non_field_errors': _('طرف حسابی با همین نام و توصیف قبلاً ثبت شده است.'),
 }
 
 
@@ -26,9 +30,9 @@ def unique_conflict(exc):
     if 'national_code' in text or 'uniq_party_national_code' in text:
         field = 'national_code'
     elif 'name' in text and 'label' in text:
-        field = 'name'
+        field = 'non_field_errors'
     else:
-        field = None
+        field = 'non_field_errors'
     raise serializers.ValidationError(
         {field: [DUPLICATE_MESSAGES.get(field, _('این مقدار تکراری است.'))]}
     )
@@ -41,6 +45,25 @@ def save_quietly(serializer):
             return serializer.save()
     except IntegrityError as exc:
         unique_conflict(exc)
+
+
+def referencing_relations(party):
+    """Every relation that still points at this party, as {name: count}.
+
+    Walks the reverse relations instead of naming them, so a new FK to Party is
+    covered without touching this function. Load.supplier uses SET_NULL and
+    would be silently cleared by a delete; that is still a reference, so it is
+    reported here and the party is kept.
+    """
+    found = {}
+    for relation in party._meta.related_objects:
+        accessor = relation.get_accessor_name()
+        count = relation.related_model._default_manager.filter(
+            **{relation.field.name: party.pk}
+        ).count()
+        if count:
+            found[accessor] = count
+    return found
 
 
 class PartyListCreateView(ListCreateAPIView):
@@ -84,3 +107,14 @@ class PartyDetailView(RetrieveUpdateAPIView):
         serializer.is_valid(raise_exception=True)
         save_quietly(serializer)
         return Response(PartySerializer(serializer.instance).data)
+
+    def delete(self, request, pk):
+        party = self.get_object()
+        references = referencing_relations(party)
+        if references:
+            # The party is part of a recorded sale or is attached to a load.
+            # Deleting it would rewrite history or silently orphan the loads,
+            # so it is kept.
+            raise PartyInUseConflict()
+        party.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)

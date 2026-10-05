@@ -1,0 +1,115 @@
+Editing a load (PATCH)
+======================
+
+PATCH http://127.0.0.1:8000/inventory/loads/{id}/
+
+Set this first:
+
+    BASE=http://127.0.0.1:8000
+
+There is no PUT. The endpoint is PATCH only, and PUT returns 405.
+
+Only `label` and `tare_weight` may be changed. Nothing else.
+
+
+Examples
+--------
+
+Relabel:
+
+   curl -s -X PATCH $BASE/inventory/loads/7/ \
+     -H 'Content-Type: application/json' \
+     -d '{"label":"  ب   الف "}'
+
+   -> 200, and the label comes back normalized as "ب الف"
+
+
+Change the basket weight:
+
+   curl -s -X PATCH $BASE/inventory/loads/7/ \
+     -H 'Content-Type: application/json' \
+     -d '{"tare_weight":"2.250"}'
+
+   -> 200
+
+
+Both at once:
+
+   curl -s -X PATCH $BASE/inventory/loads/7/ \
+     -H 'Content-Type: application/json' \
+     -d '{"label":"الف","tare_weight":"2.250"}'
+
+   -> 200
+
+
+Response
+--------
+
+200 returns the list-item shape:
+
+   {
+     "id": 7,
+     "product": 1,
+     "product_name": "خیار",
+     "label": "الف",
+     "tare_weight": "2.250"
+   }
+
+
+Outcomes
+--------
+
+  Unknown id                                -> 404
+
+  {"product": 2}  (changing the product)    -> 400
+      {"product": ["کالای بار قابل تغییر نیست."]}
+
+  Any other field, e.g. weight, rate,
+  quantity, arrived_at, supplier            -> 400
+      {"<field>": ["این فیلد قابل تغییر نیست."]}
+
+  Label already used by another
+  available load of the same product         -> 400
+      {"label": ["برچسب بارهای یک کالا باید یکتا باشد."]}
+
+  Blank label while a sibling available
+  load exists                              -> 400
+      {"label": ["برچسب همه بارهای موجود باید وارد شود."]}
+
+  Negative tare_weight                      -> 400
+
+  Another client took the label first       -> 409 stale_state
+      Refetch the list and retry.
+
+  Reusing a *finished* load's label         -> 200
+
+
+Notes
+-----
+
+* Resending the load's *current* product id is accepted and ignored, so you can
+  round-trip a whole object back without getting a 400.
+
+* The product is immutable on purpose: that is what keeps historical sales
+  pointing at the right goods.
+
+* label is normalized before saving: trimmed, whitespace runs collapsed, and the
+  Arabic look-alikes ي and ك folded to the Persian ی and ک.
+
+* tare_weight is the basket weight of *this* load, a copy taken from the product
+  when the load was created. Editing the product's tare later does not rewrite
+  loads that already exist.
+
+
+Finishing and reopening are not PATCH
+-------------------------------------
+
+Use the dedicated endpoints. Both are idempotent and return 200 with the
+list-item shape:
+
+   POST /inventory/loads/{id}/finish/    mark the load finished
+   POST /inventory/loads/{id}/restore/   make it available again
+
+A load that appears on an invoice line cannot be deleted at all:
+
+   DELETE /inventory/loads/{id}/         -> 204, or 409 in_use

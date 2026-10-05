@@ -1,0 +1,116 @@
+Creating a load
+===============
+
+POST http://127.0.0.1:8000/inventory/loads/
+
+Set this first:
+
+    BASE=http://127.0.0.1:8000
+
+The endpoint is built around a rule: a product may only have one available load
+with a blank label. Every available load except one must carry a label. That is
+why the body has three fields.
+
+
+Body
+----
+
+  product           required   Product id.
+  label             depends    Label for the *new* load.
+  existing_labels   depends    [{id, label}] -- labels for the unlabeled loads
+                              that already exist.
+
+The rule: if any available load of that product has a blank label, you must
+describe *all* of them in existing_labels, with their new labels. Miss anything
+and you get 409 stale_state.
+
+
+The scenarios
+-------------
+
+1. First load of a product, no label wanted
+
+   curl -s -X POST $BASE/inventory/loads/ \
+     -H 'Content-Type: application/json' \
+     -d '{"product":1}'
+
+   201, label is "". The label is optional here because there are no other
+   loads.
+
+
+2. First load of a product, with a label
+
+   curl -s -X POST $BASE/inventory/loads/ \
+     -H 'Content-Type: application/json' \
+     -d '{"product":1,"label":"الف"}'
+
+   201.
+
+
+3. A second load arrives and the first one has no label  (the common case)
+
+   curl -s -X POST $BASE/inventory/loads/ \
+     -H 'Content-Type: application/json' \
+     -d '{"product":1,"label":"الف","existing_labels":[{"id":7,"label":"ب"}]}'
+
+   id 7 is the unlabeled load from scenario 1. It gets labeled ب in the same
+   transaction, and the new load becomes الف.
+
+
+4. Second load, both already labeled
+
+   curl -s -X POST $BASE/inventory/loads/ \
+     -H 'Content-Type: application/json' \
+     -d '{"product":1,"label":"ج"}'
+
+   No existing_labels needed. 201.
+
+
+5. Label reused on the same product
+   -> 400 {"label": ["برچسب بارهای یک کالا باید یکتا باشد."]}
+
+
+6. Same label on a *different* product
+   -> 201. Labels are unique per product, not globally.
+
+
+7. label omitted while other available loads exist
+   -> 400 {"label": ["برچسب بار الزامی است."]}
+
+
+8. existing_labels with a stale or wrong id
+   -> 409 stale_state. This happens when someone else created or finished a
+      load between your GET and your POST. Refetch the list and retry.
+
+
+9. Blank label for an existing load while others are labeled
+   -> 400 {"label": ["برچسب همه بارهای موجود باید وارد شود."]}
+
+
+Notes
+-----
+
+* tare_weight is NOT accepted in the body. It is copied from the product's
+  tare_weight on creation, then owned by the load. Change it afterwards with
+  PATCH /inventory/loads/{id}/ -- never edit a load's tare retroactively
+  through the product, that is what broke historical sales.
+
+* label is normalized before saving: trimmed, whitespace runs collapsed, and
+  the Arabic look-alikes ي and ك folded to the Persian ی and ک.
+  Send "  ب   الف " and you get back "ب الف".
+
+* Labels are only unique among *available* loads. A finished load's label can
+  be reused on a new load.
+
+
+Client flow
+-----------
+
+The flow the API assumes:
+
+  1. GET the grouped list ( /inventory/loads/ ).
+  2. Let the user fill in the blank labels.
+  3. POST the whole picture at once.
+
+The existing_labels round-trip is what makes two people typing on two devices
+not silently overwrite each other's labels.

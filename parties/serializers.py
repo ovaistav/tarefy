@@ -1,5 +1,6 @@
 from django.utils.translation import gettext_lazy as _
 from rest_framework import serializers
+from rest_framework.validators import UniqueTogetherValidator
 
 from config.text import normalize_digits, normalize_text
 
@@ -14,6 +15,13 @@ class PartyListItemSerializer(serializers.ModelSerializer):
 
 
 class PartySerializer(serializers.ModelSerializer):
+    # ``label`` is the short "توصیف" the app shows next to the name. It keeps its
+    # API name so existing clients do not break.
+    #
+    # allow_blank lets an empty value reach validate_label, which is what turns
+    # DRF's generic "این مقدار نباید خاب باشد." into a message that names the
+    # field. Nothing blank is ever stored: validate_label still rejects it.
+    label = serializers.CharField(max_length=100, allow_blank=True)
     # The model-level validators are reused verbatim so the API and the admin
     # reject the same inputs with the same Persian messages.
     national_code = serializers.CharField(
@@ -34,7 +42,10 @@ class PartySerializer(serializers.ModelSerializer):
     phone = serializers.CharField(
         max_length=20, required=False, allow_null=True, allow_blank=True
     )
-    description = serializers.CharField(required=False, allow_blank=True)
+    # Same shape as phone; the digits are normalized when the row is saved.
+    account_number = serializers.CharField(
+        max_length=20, required=False, allow_null=True, allow_blank=True
+    )
 
     class Meta:
         model = Party
@@ -43,14 +54,27 @@ class PartySerializer(serializers.ModelSerializer):
             'name',
             'label',
             'phone',
+            'account_number',
             'national_code',
             'commission',
-            'description',
             'details',
             'created_at',
             'updated_at',
         ]
         read_only_fields = ['id', 'created_at', 'updated_at']
+        # DRF derives a UniqueTogetherValidator for (name, label), but its default
+        # message names the fields in English ("فیلدهای name, label باید...").
+        # Replaced here with the same Persian wording the IntegrityError path in
+        # the view uses, so a duplicate pair always reads the same. A partial
+        # update that touches only one of the two fields skips this entirely,
+        # which is why PATCH {"commission": ...} is unaffected.
+        validators = [
+            UniqueTogetherValidator(
+                queryset=Party.objects.all(),
+                fields=('name', 'label'),
+                message=_('طرف حسابی با همین نام و توصیف قبلاً ثبت شده است.'),
+            )
+        ]
 
     def validate_name(self, value):
         value = normalize_text(value)
@@ -61,7 +85,7 @@ class PartySerializer(serializers.ModelSerializer):
     def validate_label(self, value):
         value = normalize_text(value)
         if not value:
-            raise serializers.ValidationError(_('برچسب الزامی است.'))
+            raise serializers.ValidationError(_('توصیف الزامی است.'))
         return value
 
     def validate(self, attrs):

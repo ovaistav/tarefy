@@ -1,0 +1,307 @@
+Party CRUD
+==========
+
+Set this first:
+
+    BASE=http://127.0.0.1:8000
+
+Four operations, three endpoints:
+
+    GET    /parties/          get all
+    POST   /parties/          add one
+    GET    /parties/{id}/     read one
+    PATCH  /parties/{id}/     edit one
+    DELETE /parties/{id}/     delete one, 409 if anything references it
+
+
+1. Get all
+----------
+
+   curl -s $BASE/parties/
+
+   -> 200
+
+A plain list, no pagination, no cursor -- the app needs every party at once to
+fill its picker. Ordered by name, then label.
+
+   [
+     { "id": 1, "name": "رضایی", "label": "همسایه" },
+     { "id": 2, "name": "کریمی", "label": "دکان" }
+   ]
+
+Three fields only. For the rest of the fields use the detail endpoint.
+
+
+Search
+------
+
+   curl -s "$BASE/parties/?q=رضا"
+
+?q= matches the name OR the label, as a case-insensitive substring. It is
+normalized the same way stored values are, so Arabic look-alikes and stray
+whitespace collapse before matching:
+
+   ?q=رضا    -> party "رضایی"      (name match)
+   ?q=دکان   -> party "کریمی"      (label match)
+   ?q=%20رضايي%20   -> same as ?q=رضایی
+
+Absent or empty ?q= returns everything. No match returns [], not 404.
+
+
+2. Add one
+----------
+
+   curl -s -X POST $BASE/parties/ \
+     -H 'Content-Type: application/json' \
+     -d '{"name":"رضایی","label":"همسایه"}'
+
+   -> 201 with the full party
+
+Only name and label are required. Everything else has a default:
+
+   {
+     "id": 1,
+     "name": "رضایی",
+     "label": "همسایه",
+     "phone": null,
+     "account_number": null,
+     "national_code": null,
+     "commission": "10.00",
+     "details": {},
+     "created_at": "2026-10-05T13:51:22.104881+03:30",
+     "updated_at": "2026-10-05T13:51:22.104912+03:30"
+   }
+
+Everything at once:
+
+   curl -s -X POST $BASE/parties/ \
+     -H 'Content-Type: application/json' \
+     -d '{
+           "name": "  رضايي   شریک ",
+           "label": "  همسایه ",
+           "phone": "۰۹۱۲۳۴۵۶۷۸۹",
+           "account_number": "۰۹۸۷ ۶۵۴ ۳۲۱",
+           "national_code": "۰۴۹۹۳۷۰۸۹۹",
+           "commission": "12.5",
+           "details": {"توضیح": "خرید هفتگی", "مبدأ": "اصفهان"}
+         }'
+
+   -> 201, normalized on the way in:
+      name "رضایی شریک", phone "09123456789",
+      account_number "0987654321", national_code "0499370899",
+      commission "12.50"
+
+
+Fields
+------
+
+  name           required    max 100. Normalized, may not be blank.
+  label          required    max 100. Shown as "توصیف". Normalized, may not be
+                            blank. Short nickname, not a paragraph.
+  phone          optional    max 20. Not format-checked.
+  account_number optional    max 20. Bank account number. Not format-checked.
+                            Optional and never unique.
+  national_code  optional    10 digits + valid Iranian checksum, or null.
+  commission     optional    0 to 100, two decimals. A percentage, not money.
+                            Defaults to 10.
+  details        optional    object of short strings to short strings. This is
+                            where free-form notes go.
+
+id, created_at and updated_at are read only.
+
+
+About the name "توصیف"
+-----------------------
+
+The API field is still called `label`, and it always was. Renaming it would
+break every client that already sends it. What the app shows the user for it is
+"توصیف", and that is the word the error messages use.
+
+There is deliberately no separate `description` field any more. It duplicated
+what `details` already does, and having both a field called توصیف and another
+called description was confusing. Put notes in `details`:
+
+   curl -s -X POST $BASE/parties/ \
+     -H 'Content-Type: application/json' \
+     -d '{"name":"موسوی","label":"انبار","details":{"توضیح":"خرید عمده، پرداخت نقدی"}}'
+
+   -> 201
+
+Sending `description` is silently ignored -- the request succeeds, the value is
+simply not stored. Remove it from your client.
+
+
+Errors that mention the field
+-----------------------------
+
+   {"label": ["توصیف الزامی است."]}                       blank or whitespace-only
+   {"non_field_errors": ["طرف حسابی با همین نام و توصیف قبلاً ثبت شده است."]}
+                                                            duplicate name+توصیف pair
+
+A duplicate pair is reported under non_field_errors, not under "name", because it
+is a complaint about the two fields together.
+
+Omitting label altogether gives the framework's generic message instead:
+
+   {"label": ["این مقدار لازم است."]}
+
+because the field is missing rather than blank.
+
+
+account_number
+--------------
+
+   curl -s -X POST $BASE/parties/ \
+     -H 'Content-Type: application/json' \
+     -d '{"name":"کریمی","label":"دکان","account_number":"۰۱۲ ۳۴۵ ۶۷۸"}'
+
+   -> 201, account_number "012345678"
+
+Behaves exactly like phone:
+
+* Persian and Arabic-Indic digits are mapped to ASCII 0-9.
+* All spaces are removed.
+* Trimmed.
+* 20 characters maximum. Longer -> 400.
+
+   curl -s -X POST $BASE/parties/ \
+     -H 'Content-Type: application/json' \
+     -d '{"name":"a","label":"b","account_number":"123456789012345678901"}'
+   -> 400 {"account_number": ["Ensure this field has no more than 20 characters."]}
+
+* NOT unique. Unlike national_code, two parties may carry the same account.
+  One account often serves a whole family or a shop with several contacts.
+* Not validated as a real account number. Any string of digits up to 20 chars
+  is accepted; the server does not know which bank it belongs to.
+
+Two gotchas about an absent value:
+
+* Omitting account_number, or sending null, or sending "" all store an empty
+  string. The field is nullable, but normalization runs on save and turns a
+  missing value into "" -- the same thing phone has always done.
+* Parties created *before* this field existed keep a real null in the database.
+  So the API can return either null or "" for "no account number". Test for
+  truthiness, not for "".
+
+
+Common 400s
+-----------
+
+  Missing or blank name          {"name": ["نام الزامی است."]}
+  Blank label ("توصیف")          {"label": ["توصیف الزامی است."]}
+  name+توصیف already taken        {"non_field_errors": ["طرف حسابی با همین نام و توصیف قبلاً ثبت شده است."]}
+  national_code already taken    {"national_code": ["کد ملی قبلاً ثبت شده است."]}
+  national_code not 10 digits    {"national_code": ["کد ملی باید دقیقاً ۱۰ رقم باشد."]}
+  national_code bad checksum     {"national_code": ["کد ملی معتبر نیست."]}
+  account_number over 20 chars   {"account_number": [...]}
+  commission out of range        {"commission": [...]}
+  details broken                 {"details": [...]}
+
+Every 400 has the shape { "<field>": ["<Persian message>"] }, except the duplicate
+pair, which lands under non_field_errors.
+
+Duplicates are 400, not 409. These are plain uniqueness rules, not a conflict
+about server state.
+
+Two parties may share a name as long as the توصیف values differ
+("رضایی / همسایه" and "رضایی / دکان" are two different parties), and many parties
+may have no national_code at all.
+
+
+3. Read one
+-----------
+
+   curl -s $BASE/parties/1/
+
+   -> 200, the full object
+
+   curl -s $BASE/parties/999999/
+   -> 404  {"detail": "موردی با این مشخصات یافت نشد."}
+
+
+4. Edit one
+-----------
+
+   curl -s -X PATCH $BASE/parties/1/ \
+     -H 'Content-Type: application/json' \
+     -d '{"commission":"7.5"}'
+
+   -> 200 with the full party, commission "7.50", everything else untouched
+
+Several fields at once:
+
+   curl -s -X PATCH $BASE/parties/1/ \
+     -H 'Content-Type: application/json' \
+     -d '{"phone":"09121111111","account_number":"9876543210","details":{"توضیح":"مشتری وفادار"}}'
+
+   -> 200
+
+Updates are always partial: send only what changes. PUT works too and behaves
+identically, because the app only ever sends the fields it wants to change.
+
+   curl -s -X PATCH $BASE/parties/1/ \
+     -H 'Content-Type: application/json' \
+     -d '{"name":"  رضايي  ","label":"همسایه"}'
+
+   -> 200, name normalized to "رضایی"
+
+   curl -s -X PATCH $BASE/parties/1/ \
+     -H 'Content-Type: application/json' \
+     -d '{"account_number":"۰۹۸۷ ۶۵۴ ۳۲۱"}'
+
+   -> 200, account_number "0987654321"
+
+   curl -s -X PATCH $BASE/parties/1/ \
+     -H 'Content-Type: application/json' \
+     -d '{"account_number":""}'
+
+   -> 200, account_number "" (the way to clear it)
+
+   curl -s -X PATCH $BASE/parties/999999/ -d '{}'
+   -> 404
+
+
+5. Delete one
+-------------
+
+   curl -s -X DELETE $BASE/parties/9/
+
+   -> 204, empty body, the row is gone
+
+   curl -s -X DELETE $BASE/parties/999999/
+   -> 404  {"detail": "موردی با این مشخصات یافت نشد."}
+
+
+The rule: only when nothing points at the party.
+
+A party may be deleted only if no other row references it. Anything that does
+reference it, and you get 409 instead:
+
+   curl -s -X DELETE $BASE/parties/1/
+
+   -> 409
+      {"code": "in_use",
+       "detail": "این طرف حساب در فروش‌ها یا بارها استفاده شده است و قابل حذف نیست."}
+
+What counts as a reference:
+
+  sales.Invoice.buyer       a recorded invoice names this party as the buyer.
+                            on_delete=PROTECT. A party that has been invoiced is
+                            part of your accounting history, and removing it would
+                            rewrite the meaning of a recorded sale.
+
+  inventory.Load.supplier   the party is attached to a load as its supplier.
+                            on_delete=SET_NULL, so the database *would* let the
+                            delete through and quietly strip the supplier from
+                            every one of those loads. That counts as a reference
+                            all the same, and the party is kept.
+
+Either one blocks the delete. Only a party with no invoices and no loads can go.
+
+The check walks the reverse relations of the model instead of naming them, so a
+foreign key added to Party later is covered without any change here. There is no
+soft delete and no archive flag: a party is either referenced or deletable.
+
+If you created a party by mistake and nothing references it, delete it. If
+something does reference it, edit it into the name you actually wanted instead --
+that is the intended path for a party that is already in use.

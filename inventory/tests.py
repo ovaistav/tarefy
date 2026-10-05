@@ -226,29 +226,74 @@ class LoadRestoreTests(APITestCase):
 
 class LoadListTests(APITestCase):
     def setUp(self):
-        self.product_a = Product.objects.create(name='آلو')
+        self.product_a = Product.objects.create(
+            name='آلو', sticker='apple', background='#2E7D32'
+        )
         self.product_b = Product.objects.create(name='پیاز')
         self.available = Load.objects.create(product=self.product_a, label='الف')
+        self.second_available = Load.objects.create(product=self.product_a, label='ب')
         self.finished = Load.objects.create(
             product=self.product_b, label='ب', finished_at='2026-01-01T10:00:00Z'
         )
         self.url = reverse('load-list-create')
 
-    def test_list_without_filter_returns_all_loads(self):
+    def load_ids(self, response, name):
+        return [item['id'] for item in response.data[name]['loads']]
+
+    def test_list_is_grouped_by_product_name(self):
         response = self.client.get(self.url)
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(len(response.data), 2)
+        self.assertEqual(sorted(response.data.keys()), ['آلو', 'پیاز'])
+
+    def test_group_carries_the_sticker_and_background_of_its_product(self):
+        response = self.client.get(self.url)
+        self.assertEqual(
+            response.data['آلو'],
+            {
+                'product': self.product_a.id,
+                'sticker': 'apple',
+                'background': '#2E7D32',
+                'loads': response.data['آلو']['loads'],
+            },
+        )
+        self.assertEqual(response.data['پیاز']['sticker'], '')
+        self.assertEqual(response.data['پیاز']['background'], '')
+
+    def test_group_loads_keep_the_list_item_shape(self):
+        response = self.client.get(self.url)
+        self.assertEqual(
+            sorted(response.data['آلو']['loads'][0].keys()),
+            ['id', 'label', 'product', 'product_name', 'tare_weight'],
+        )
+
+    def test_all_loads_of_a_product_land_in_one_group(self):
+        response = self.client.get(self.url)
+        self.assertEqual(
+            self.load_ids(response, 'آلو'), [self.available.id, self.second_available.id]
+        )
+
+    def test_list_without_filter_returns_finished_loads_too(self):
+        response = self.client.get(self.url)
+        self.assertEqual(self.load_ids(response, 'پیاز'), [self.finished.id])
 
     def test_available_true_filters_finished_loads(self):
         response = self.client.get(self.url, {'available': 'true'})
         self.assertEqual(response.status_code, 200)
-        self.assertEqual([item['id'] for item in response.data], [self.available.id])
-        self.assertEqual(response.data[0]['product_name'], 'آلو')
+        self.assertEqual(list(response.data.keys()), ['آلو'])
+        self.assertEqual(
+            self.load_ids(response, 'آلو'), [self.available.id, self.second_available.id]
+        )
+
+    def test_a_product_without_any_load_has_no_group(self):
+        Product.objects.create(name='گوجه', sticker='tomato')
+        response = self.client.get(self.url)
+        self.assertNotIn('گوجه', response.data)
 
     def test_list_is_ordered_by_product_name_then_id(self):
         response = self.client.get(self.url)
+        self.assertEqual(list(response.data.keys()), ['آلو', 'پیاز'])
         self.assertEqual(
-            [item['product_name'] for item in response.data], ['آلو', 'پیاز']
+            self.load_ids(response, 'آلو'), [self.available.id, self.second_available.id]
         )
 
 
@@ -332,11 +377,11 @@ class LoadTareWeightTests(APITestCase):
             str(Load.objects.get(pk=created.data['id']).tare_weight), '1.500'
         )
 
-    def test_list_items_include_the_tare(self):
+def test_list_items_include_the_tare(self):
         self.client.post(self.url, {'product': self.product.id}, format='json')
         response = self.client.get(self.url)
         self.assertEqual(
-            sorted(response.data[0].keys()),
+            sorted(response.data['خیار']['loads'][0].keys()),
             ['id', 'label', 'product', 'product_name', 'tare_weight'],
         )
 

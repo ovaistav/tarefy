@@ -41,6 +41,27 @@ class LoadListCreateView(ListCreateAPIView):
             queryset = queryset.filter(finished_at__isnull=True)
         return queryset
 
+    def list(self, request, *args, **kwargs):
+        # The app renders one tile per product, so the list is grouped by
+        # product name and each group carries the sticker the tile is drawn with.
+        # Product.name is unique, so the key identifies exactly one product.
+        loads = list(self.get_queryset())
+        serializer = LoadListItemSerializer(loads, many=True)
+        grouped = {}
+        for load, item in zip(loads, serializer.data):
+            product = load.product
+            group = grouped.setdefault(
+                product.name,
+                {
+                    'product': product.id,
+                    'sticker': product.sticker,
+                    'background': product.background,
+                    'loads': [],
+                },
+            )
+            group['loads'].append(item)
+        return Response(grouped)
+
     def create(self, request, *args, **kwargs):
         serializer = LoadCreateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
